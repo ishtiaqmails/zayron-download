@@ -64,7 +64,10 @@ if (!db.sessions) db.sessions = {};
 if (!db.accounts) db.accounts = {};
 if (!db.admin) { const ap = mkPass(db.admin_key || 'admin'); db.admin = { username: 'admin', salt: ap.salt, hash: ap.hash }; }
 if (!db.config.downloads) db.config.downloads = { windows: 'https://zayron.tv/windows', android: 'https://zayron.tv/android' };
-if (!db.config.update) db.config.update = { windows: { on: false, min: 0, latest: '', url: '', msg: '' }, android: { on: false, min: 0, latest: '', url: '', msg: '' }, ios: { on: false, min: 0, latest: '', url: '', msg: '' } };
+if (!db.config.update) db.config.update = { windows: { on: false, min: 0, latest: '', url: '', msg: '' }, android: { on: false, min: 0, latest: '', url: '', msg: '' } };
+// The list of apps you actually ship (drives Player Modes + Force Update). Add more as you build them.
+if (!db.config.apps) db.config.apps = [{ id: 'windows', label: 'Windows' }, { id: 'android', label: 'Android' }];
+if (!db.maxver) db.maxver = {};   // highest version code seen per app (for 1-tap "force to latest")
 if (!db.admin.api_key) db.admin.api_key = crypto.randomBytes(16).toString('hex');
 Object.keys(db.accounts).forEach(function (id) { if (!db.accounts[id].api_key) db.accounts[id].api_key = crypto.randomBytes(16).toString('hex'); if (db.accounts[id].api_enabled === undefined) db.accounts[id].api_enabled = false; });
 if (db.resellers && Object.keys(db.resellers).length && !Object.keys(db.accounts).length) {
@@ -151,11 +154,13 @@ function activate(uid, mac, app, plan, note, isRenew) {
 let __dirty = false;
 function markDirty() { __dirty = true; }
 setInterval(function () { if (__dirty) { __dirty = false; try { save(db); } catch (e) {} } }, 15000).unref();
-function recordSeen(mac, app, ver) {
+function recordSeen(mac, app, ver, verc) {
   if (!mac || mac.replace(/[^0-9A-F]/g, '').length < 6) return;
   const s = db.seen[mac] || { first: now(), count: 0 };
-  s.app = app || s.app || 'unknown'; if (ver) s.ver = String(ver).slice(0, 20); s.last = now(); s.count = (s.count || 0) + 1;
-  db.seen[mac] = s; markDirty();
+  s.app = app || s.app || 'unknown'; if (ver) s.ver = String(ver).slice(0, 20); if (verc) s.verc = parseInt(verc) || 0; s.last = now(); s.count = (s.count || 0) + 1;
+  db.seen[mac] = s;
+  const vc = parseInt(verc) || 0; if (vc > 0 && app) { if (!db.maxver[app] || vc > db.maxver[app]) db.maxver[app] = vc; }   // newest version in the wild
+  markDirty();
 }
 function computeStats() {
   const t = now(), MIN = 60 * 1000, H = 3600 * 1000, D = 24 * H;
@@ -174,8 +179,8 @@ function stateFor(cu) {
   if (cu.role === 'admin') {
     const accs = {}; Object.keys(db.accounts).forEach(function (id) { accs[id] = accountView(id); });
     return { role: 'admin', me: { username: db.admin.username, credits: null },
-      config: db.config, accounts: accs, devices: db.devices, stats: computeStats(),
-      ledger: db.ledger.slice(-120).reverse().map(fmtLedger) };
+      config: db.config, accounts: accs, devices: db.devices, stats: computeStats(), maxver: db.maxver,
+      allseen: db.seen, ledger: db.ledger.slice(-120).reverse().map(fmtLedger) };
   }
   const uid = cu.uid, ids = subtreeIds(uid); const accs = {}; ids.forEach(function (id) { accs[id] = accountView(id); });
   const devs = {}; Object.keys(db.devices).forEach(function (m) { if (ownsDevice(uid, m) && db.devices[m].activated_by !== 'admin' && isDesc(uid, db.devices[m].activated_by)) devs[m] = db.devices[m]; });
@@ -195,11 +200,14 @@ const server = http.createServer(async (req, res) => {
   if (p.endsWith('/api/check') && req.method === 'POST') {
     let body = {}; try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) {}
     const app = (body.app || 'windows').toLowerCase(); const mac = macKey(body.mac); const c = db.config;
-    recordSeen(mac, app, body.ver);
+    recordSeen(mac, app, body.ver, body.verc);
     const uc = (c.update && c.update[app]) || null;                                  // force-update config
     const upd = (uc && uc.on) ? { on: true, min: uc.min || 0, latest: uc.latest || '', url: uc.url || '', msg: uc.msg || '' } : null;
     const reply = (o) => json(res, 200, upd ? Object.assign({ upd: upd }, o) : o);   // app compares its verCode < upd.min
     if (c.kill[app]) return reply({ active: false, kill: true, message: 'This app is temporarily unavailable. ' + c.contact });
+    // A device you explicitly BLOCK is blocked in FREE mode too (an admin kill-switch for one device).
+    let bd = db.devices[mac];
+    if (bd && bd.status === 'blocked') return reply({ active: false, blocked: true, message: 'This device has been blocked. ' + c.contact });
     if (!c.paid[app]) return reply({ active: true, free: true });
     let dev = db.devices[mac];
     if (deviceActive(dev)) return reply({ active: true, plan: dev.plan, expires: dev.expires });
@@ -301,6 +309,19 @@ const server = http.createServer(async (req, res) => {
       if (a === 'checkMac') { const mac = macKey(b.mac); const s = db.seen[mac] || null; const d = db.devices[mac] || null; let dv = null;
         if (d) { const mine = role === 'admin' || isDesc(uid, d.activated_by); dv = { plan: d.plan, expires: d.expires, status: d.status, active: deviceActive(d), note: mine ? d.note : '', app: d.app, mine: mine }; }
         return json(res, 200, { ok: true, mac: mac, installed: !!s, seen: s ? { app: s.app, ver: s.ver || '', last: s.last, first: s.first, count: s.count || 0 } : null, device: dv }); }
+
+      // edit a reseller/sub-reseller's details (admin, or a parent editing its own tree)
+      if (a === 'editAccount') { const t = db.accounts[b.id]; if (!t) return json(res, 200, { ok: false, error: 'unknown account' }); if (role !== 'admin' && !isDesc(uid, b.id)) return json(res, 403, { error: 'not in your tree' });
+        if (b.username != null) { const un = String(b.username).trim(); if (un.length < 3) return json(res, 200, { ok: false, error: 'username too short' }); if (!/^[a-zA-Z0-9_.-]+$/.test(un)) return json(res, 200, { ok: false, error: 'username: letters, numbers, . _ - only' }); if (un.toLowerCase() !== (t.username || '').toLowerCase() && usernameTaken(un)) return json(res, 200, { ok: false, error: 'username already taken' }); t.username = un; }
+        if (b.name != null) t.name = String(b.name).trim() || t.name;
+        if (b.email != null) t.email = String(b.email).trim();
+        save(db); return json(res, 200, { ok: true }); }
+
+      // apps registry (admin) — which apps you ship; drives Player Modes + Force Update
+      if (a === 'addApp') { if (!adminOnly()) return json(res, 403, { error: 'admins only' }); const id = String(b.id || '').toLowerCase().replace(/[^a-z0-9]/g, ''); if (!id) return json(res, 200, { ok: false, error: 'bad app id' }); if (db.config.apps.some(function (x) { return x.id === id; })) return json(res, 200, { ok: false, error: 'app already exists' }); db.config.apps.push({ id: id, label: (b.label || id).trim() }); db.config.paid[id] = false; db.config.kill[id] = false; db.config.update[id] = { on: false, min: 0, latest: '', url: '', msg: '' }; save(db); return json(res, 200, { ok: true }); }
+      if (a === 'removeApp') { if (!adminOnly()) return json(res, 403, { error: 'admins only' }); db.config.apps = db.config.apps.filter(function (x) { return x.id !== b.id; }); save(db); return json(res, 200, { ok: true }); }
+      // 1-tap force-update: set the minimum to the newest version currently live (no typing)
+      if (a === 'forceLatest') { if (!adminOnly()) return json(res, 403, { error: 'admins only' }); const ap = b.app; const latest = db.maxver[ap] || 0; if (!latest) return json(res, 200, { ok: false, error: 'no live version seen yet for this app' }); if (!db.config.update[ap]) db.config.update[ap] = {}; const cu = db.config.update[ap]; cu.on = true; cu.min = latest; if (b.url) cu.url = String(b.url).trim(); if (!cu.msg) cu.msg = 'A new version is available. Please update to continue.'; save(db); return json(res, 200, { ok: true, min: latest }); }
 
       // force-update config (admin only)
       if (a === 'setUpdate') { if (!adminOnly()) return json(res, 403, { error: 'admins only' }); const ap = b.app; if (!db.config.update[ap]) db.config.update[ap] = {}; db.config.update[ap] = { on: !!b.on, min: parseInt(b.min) || 0, latest: (b.latest || '').trim(), url: (b.url || '').trim(), msg: (b.msg || '').trim() }; save(db); return json(res, 200, { ok: true }); }
@@ -658,9 +679,16 @@ function renderResellers(){
     var name='<span style="padding-left:'+pad+'px">'+(n.depth>0?'<span style="color:var(--muted)">↳ </span>':'')+'<b>'+esc(a.name)+'</b>'+(a.children?' <span class="sub" style="margin:0">('+a.children+')</span>':'')+'</span>';
     t+='<tr class="treerow"><td>'+name+'</td><td class="mono">'+esc(a.username)+'</td><td><b>'+(a.credits||0)+'</b></td>'+
       '<td><button class="'+(a.enabled?'g':'d')+' sm" data-tacc="'+n.id+'">'+(a.enabled?'Enabled':'Disabled')+'</button></td>'+
-      '<td style="white-space:nowrap"><button class="sm" data-topup="'+n.id+'">Credits</button> <button class="g sm" data-reset="'+n.id+'">Password</button></td></tr>';});
+      '<td style="white-space:nowrap"><button class="g sm" data-editacc="'+n.id+'">Edit</button> <button class="sm" data-topup="'+n.id+'">Credits</button> <button class="g sm" data-reset="'+n.id+'">Password</button></td></tr>';});
   $('restab').innerHTML=t;
 }
+function openEditAccount(id){var a=(S.accounts||{})[id]||{};modal(
+  '<h3>Edit account</h3><div class="sub">Change this account\\'s details.</div>'+
+  '<div class="f"><label>Display name</label><input id="ea_name" value="'+esc(a.name||'')+'"></div>'+
+  '<div class="f"><label>Username</label><input id="ea_user" value="'+esc(a.username||'')+'" autocapitalize="none"></div>'+
+  '<div class="f"><label>Email</label><input id="ea_email" value="'+esc(a.email||'')+'"></div>'+
+  '<div class="merr" id="m_err"></div><div class="foot"><button class="g" onclick="closeModal()">Cancel</button><button onclick="submitEditAccount(\\''+id+'\\')">Save</button></div>');}
+function submitEditAccount(id){api('editAccount',{id:id,name:$('ea_name').value,username:$('ea_user').value,email:$('ea_email').value}).then(function(d){if(d.ok){closeModal();load();}else $('m_err').textContent=d.error||'error';});}
 // ADMIN ONLY — full drag-and-drop tree. Drop an account onto another to move it (uses the reparent action).
 function acInit(nm){return String(nm||'?').split(' ').map(function(w){return w[0]||'';}).join('').slice(0,2).toUpperCase();}
 function renderResTree(){
@@ -674,6 +702,7 @@ function renderResTree(){
       '<span><span class="tnm">'+esc(a.name)+' <span class="tag" style="background:'+tcol+';color:#fff;font-size:9px;padding:2px 7px">'+tier+'</span></span><div class="tmeta">@'+esc(a.username)+(ck.length?(' · '+ck.length+' sub'):'')+(a.enabled?'':' · <span style="color:var(--red)">disabled</span>')+'</div></span>'+
       '<span class="tcr">'+(a.credits||0)+' cr</span>'+
       '<span class="tacts">'+
+        '<button class="g sm" data-editacc="'+id+'">Edit</button>'+
         '<button class="sm" data-topup="'+id+'">Credits</button>'+
         '<button class="g sm" data-reset="'+id+'">Pass</button>'+
         '<button class="'+(a.api_enabled?'':'g')+' sm" style="'+(a.api_enabled?'background:var(--violet)':'')+'" data-tapi="'+id+'">API '+(a.api_enabled?'ON':'off')+'</button>'+
@@ -708,13 +737,16 @@ function resMove(id,target){ if(!id||id===target)return;
   if(target!=='admin'&&isDescId(id,target)){toast('Can’t move an account under its own sub-account');return;}
   api('reparent',{id:id,parent:target}).then(function(d){if(d.ok)load();else toast(d.error||'move failed');});
 }
+function appList(){return (S.config&&S.config.apps)||[{id:'windows',label:'Windows'},{id:'android',label:'Android'}];}
 function renderModes(){
-  if(ROLE!=='admin')return;var c=S.config;if(!c||!c.paid)return;var apps=['windows','android','ios'],h='';
-  apps.forEach(function(a){h+='<div style="border:1px solid var(--line);border-radius:14px;padding:16px;background:#f9fbfe"><h4 style="margin:0 0 12px;font-size:14px">'+a.charAt(0).toUpperCase()+a.slice(1)+'</h4>'+
+  if(ROLE!=='admin')return;var c=S.config;if(!c||!c.paid)return;var h='';
+  appList().forEach(function(ap){var a=ap.id;h+='<div style="border:1px solid var(--line);border-radius:14px;padding:16px;background:#f9fbfe;position:relative"><h4 style="margin:0 0 12px;font-size:14px">'+esc(ap.label)+' <button class="g sm" style="position:absolute;right:12px;top:12px;padding:3px 8px" data-rmapp="'+a+'" title="Remove app">✕</button></h4>'+
     '<div style="display:flex;align-items:center;justify-content:space-between;margin:9px 0"><span class="sub" style="margin:0">Billing</span><button class="sm" style="min-width:80px;background:'+(c.paid[a]?'var(--cyan)':'#eef3f9')+';color:'+(c.paid[a]?'#fff':'#455872')+'" data-tog="paid" data-app="'+a+'">'+(c.paid[a]?'PAID':'FREE')+'</button></div>'+
     '<div style="display:flex;align-items:center;justify-content:space-between;margin:9px 0"><span class="sub" style="margin:0">Availability</span><button class="sm" style="min-width:80px;background:'+(c.kill[a]?'var(--red)':'var(--greenbg)')+';color:'+(c.kill[a]?'#fff':'var(--green)')+'" data-tog="kill" data-app="'+a+'">'+(c.kill[a]?'KILLED':'LIVE')+'</button></div></div>';});
+  h+='<div style="border:1.5px dashed var(--line);border-radius:14px;padding:16px;display:flex;flex-direction:column;gap:8px;justify-content:center"><div class="sub" style="margin:0">Add an app you ship</div><input id="newAppLabel" placeholder="Name e.g. Fire TV" style="width:100%"><button class="sm" onclick="addApp()">+ Add app</button></div>';
   $('modes').innerHTML=h;$('trial').value=c.trial_days||0;$('contact').value=c.contact||'';
 }
+function addApp(){var label=($('newAppLabel').value||'').trim();if(!label)return;var id=label.toLowerCase().replace(/[^a-z0-9]/g,'');api('addApp',{id:id,label:label}).then(function(d){if(d.ok)load();else toast(d.error||'error');});}
 function renderDownloads(){
   var dl=(S.config&&S.config.downloads)||{windows:'',android:''};
   function card(title,url,sub){var q='https://api.qrserver.com/v1/create-qr-code/?size=150x150&data='+encodeURIComponent(url||'');
@@ -738,7 +770,10 @@ document.addEventListener('click',function(e){var b=e.target.closest('button');i
   if(b.dataset.delacc){if(confirm('Delete this account?'))api('deleteAccount',{id:b.dataset.delacc}).then(load);return;}
   if(b.dataset.fon){toggleForce(b.dataset.fon);return;}
   if(b.dataset.fsave){saveForce(b.dataset.fsave);return;}
+  if(b.dataset.flatest){if(confirm('Force EVERY user of this app onto the newest version now?'))forceLatest(b.dataset.flatest);return;}
+  if(b.dataset.rmapp){if(confirm('Remove this app from the panel?'))api('removeApp',{id:b.dataset.rmapp}).then(load);return;}
   if(b.dataset.tapi){api('toggleApi',{id:b.dataset.tapi}).then(load);return;}
+  if(b.dataset.editacc){openEditAccount(b.dataset.editacc);return;}
 });
 
 /* modals */
@@ -785,18 +820,21 @@ function openEdit(mac){var d=S.devices[mac]||{};var exp=(d.expires?new Date(d.ex
 function submitEdit(mac){var exp=$('e_exp').value;var plan=$('e_plan').value;var payload={mac:mac,plan:plan,status:$('e_status').value,note:$('e_note').value,expires:(plan==='lifetime'?'lifetime':(exp||''))};
   api('editDevice',payload).then(function(d){if(d.ok){closeModal();load();}else $('m_err').textContent=d.error||'error';});}
 
-function renderForce(){if(ROLE!=='admin')return;var upd=(S.config&&S.config.update)||{};var apps=['windows','android','ios'];var h='';
-  apps.forEach(function(a){var u=upd[a]||{};h+='<div style="border:1px solid var(--line);border-radius:14px;padding:16px;background:#f9fbfe;margin-bottom:12px">'+
-    '<div class="row" style="justify-content:space-between"><h4 style="margin:0;font-size:15px">'+a.charAt(0).toUpperCase()+a.slice(1)+'</h4>'+
+function renderForce(){if(ROLE!=='admin')return;var upd=(S.config&&S.config.update)||{};var mv=(S.maxver)||{};var h='';
+  appList().forEach(function(ap){var a=ap.id;var u=upd[a]||{};var latest=mv[a]||0;
+    h+='<div style="border:1px solid var(--line);border-radius:14px;padding:16px;background:#f9fbfe;margin-bottom:12px">'+
+    '<div class="row" style="justify-content:space-between"><h4 style="margin:0;font-size:15px">'+esc(ap.label)+' <span class="sub" style="margin:0;font-weight:600">'+(latest?('newest live: v-code '+latest):'no live version seen yet')+'</span></h4>'+
     '<button class="sm" style="min-width:88px;background:'+(u.on?'var(--green)':'#eef3f9')+';color:'+(u.on?'#fff':'#455872')+'" data-fon="'+a+'">'+(u.on?'FORCED ON':'OFF')+'</button></div>'+
-    '<div class="row" style="margin-top:10px"><label style="width:130px">Minimum version code</label><input id="fu_min_'+a+'" type="number" value="'+(u.min||0)+'" style="width:110px"><span class="sub" style="margin:0">apps older than this are blocked</span></div>'+
-    '<div class="row" style="margin-top:8px"><label style="width:130px">Latest version label</label><input id="fu_lat_'+a+'" value="'+esc(u.latest||'')+'" placeholder="e.g. 3.6.5" style="width:160px"></div>'+
-    '<div class="row" style="margin-top:8px"><label style="width:130px">Update link</label><input id="fu_url_'+a+'" class="grow" value="'+esc(u.url||'')+'" placeholder="https://zayron.tv/..."></div>'+
+    '<div class="row" style="margin-top:12px"><button style="background:var(--navy)" data-flatest="'+a+'">⚡ Force everyone to the newest version</button><span class="sub" style="margin:0">one tap — no typing</span><span class="ok" id="fu_ok_'+a+'"></span></div>'+
+    '<div class="sub" style="margin:12px 0 4px">Or set it manually:</div>'+
+    '<div class="row" style="margin-top:2px"><label style="width:130px">Minimum version code</label><input id="fu_min_'+a+'" type="number" value="'+(u.min||0)+'" style="width:110px"><span class="sub" style="margin:0">apps older than this are blocked</span></div>'+
+    '<div class="row" style="margin-top:8px"><label style="width:130px">Update link</label><input id="fu_url_'+a+'" class="grow" value="'+esc(u.url||'')+'" placeholder="direct .apk / .exe for auto-install"></div>'+
     '<div class="row" style="margin-top:8px"><label style="width:130px">Message</label><input id="fu_msg_'+a+'" class="grow" value="'+esc(u.msg||'')+'" placeholder="A new version is available. Please update."></div>'+
-    '<div class="row" style="margin-top:10px"><button class="sm" data-fsave="'+a+'">Save '+a+'</button><span class="ok" id="fu_ok_'+a+'"></span></div></div>';});
+    '<div class="row" style="margin-top:10px"><button class="sm" data-fsave="'+a+'">Save</button></div></div>';});
   $('fupd').innerHTML=h;}
-function saveForce(a){var u=(S.config.update&&S.config.update[a])||{};api('setUpdate',{app:a,on:!!u.on,min:$('fu_min_'+a).value,latest:$('fu_lat_'+a).value,url:$('fu_url_'+a).value,msg:$('fu_msg_'+a).value}).then(function(){$('fu_ok_'+a).textContent='Saved ✓';setTimeout(function(){$('fu_ok_'+a).textContent='';},1500);load();});}
-function toggleForce(a){var u=(S.config.update&&S.config.update[a])||{};api('setUpdate',{app:a,on:!u.on,min:$('fu_min_'+a).value,latest:$('fu_lat_'+a).value,url:$('fu_url_'+a).value,msg:$('fu_msg_'+a).value}).then(load);}
+function saveForce(a){var u=(S.config.update&&S.config.update[a])||{};api('setUpdate',{app:a,on:!!u.on,min:$('fu_min_'+a).value,latest:u.latest||'',url:$('fu_url_'+a).value,msg:$('fu_msg_'+a).value}).then(function(){toast('Saved');load();});}
+function toggleForce(a){var u=(S.config.update&&S.config.update[a])||{};api('setUpdate',{app:a,on:!u.on,min:$('fu_min_'+a).value,latest:u.latest||'',url:$('fu_url_'+a).value,msg:$('fu_msg_'+a).value}).then(load);}
+function forceLatest(a){var dl=(S.config&&S.config.downloads)||{};var url=(a==='android')?dl.android:(a==='windows')?dl.windows:'';api('forceLatest',{app:a,url:url}).then(function(d){if(d.ok){toast('Forcing everyone to version-code '+d.min);load();}else toast(d.error||'error');});}
 function previewForce(){window.open('https://zayron.tv/act/forcepreview','_blank');}
 
 function renderApi(){
