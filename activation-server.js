@@ -82,7 +82,8 @@ const SESSION_TTL = 30 * 24 * 3600 * 1000;
 function newSession(uid, role) { const t = crypto.randomBytes(24).toString('hex'); db.sessions[t] = { uid: uid, role: role, exp: now() + SESSION_TTL }; save(db); return t; }
 function getSession(t) { const s = db.sessions[t]; if (!s) return null; if (s.exp < now()) { delete db.sessions[t]; return null; } return s; }
 function dropSession(t) { if (t && db.sessions[t]) { delete db.sessions[t]; save(db); } }
-function currentUser(req) { return getSession(cookie(req, 'zadm')); }
+function tokenOf(req) { return req.headers['x-auth'] || cookie(req, 'zadm'); }   // header first (survives Cloudflare), cookie fallback
+function currentUser(req) { return getSession(tokenOf(req)); }
 
 // ---------- tree helpers ----------
 function isDesc(ancestor, id) { if (ancestor === 'admin') return true; let cur = id, g = 0; while (cur && g++ < 200) { if (cur === ancestor) return true; const a = db.accounts[cur]; cur = a ? a.parent : null; } return false; }
@@ -203,13 +204,13 @@ const server = http.createServer(async (req, res) => {
     let b = {}; try { b = JSON.parse(await readBody(req) || '{}'); } catch (e) {}
     const un = String(b.username || '').trim(), pw = String(b.password || '');
     if (un.toLowerCase() === (db.admin.username || 'admin').toLowerCase() && chkPass(pw, db.admin)) {
-      const t = newSession('admin', 'admin'); res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': 'zadm=' + t + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000' }); return res.end('{"ok":true,"role":"admin"}');
+      const t = newSession('admin', 'admin'); res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': 'zadm=' + t + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000' }); return res.end(JSON.stringify({ ok: true, role: 'admin', token: t }));
     }
     const id = Object.keys(db.accounts).find(function (i) { return (db.accounts[i].username || '').toLowerCase() === un.toLowerCase(); });
-    if (id) { const a = db.accounts[id]; if (a.enabled === false) return json(res, 200, { ok: false, error: 'account disabled' }); if (chkPass(pw, a)) { const t = newSession(id, 'reseller'); res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': 'zadm=' + t + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000' }); return res.end('{"ok":true,"role":"reseller"}'); } }
+    if (id) { const a = db.accounts[id]; if (a.enabled === false) return json(res, 200, { ok: false, error: 'account disabled' }); if (chkPass(pw, a)) { const t = newSession(id, 'reseller'); res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': 'zadm=' + t + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000' }); return res.end(JSON.stringify({ ok: true, role: 'reseller', token: t })); } }
     return json(res, 200, { ok: false, error: 'wrong username or password' });
   }
-  if (p.endsWith('/admin/logout') && req.method === 'POST') { dropSession(cookie(req, 'zadm')); res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': 'zadm=; Path=/; HttpOnly; Max-Age=0' }); return res.end('{"ok":true}'); }
+  if (p.endsWith('/admin/logout') && req.method === 'POST') { dropSession(tokenOf(req)); res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': 'zadm=; Path=/; HttpOnly; Max-Age=0' }); return res.end('{"ok":true}'); }
 
   // ADMIN/RESELLER ACTIONS
   if (p.indexOf('/admin/act') >= 0 && req.method === 'POST') {
@@ -476,11 +477,14 @@ th{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.
 var S={},ROLE='',FILTER='all',SOON=14*24*3600*1000,__auto=null;
 function $(id){return document.getElementById(id);}
 function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
-function api(action,extra){return fetch('admin/act',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({action:action},extra||{}))}).then(function(r){return r.json();});}
-function login(){fetch('admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('lu').value,password:$('lp').value})}).then(function(r){return r.json();}).then(function(d){if(d.ok){$('login').style.display='none';$('shell').style.display='flex';load();startAuto();}else $('lerr').textContent=d.error||'Wrong username or password';});}
-function logout(){api('state');fetch('admin/logout',{method:'POST'}).then(function(){if(__auto){clearInterval(__auto);__auto=null;}location.reload();});}
+function tok(){try{return localStorage.getItem('zadm_tok')||'';}catch(e){return '';}}
+function api(action,extra){return fetch('admin/act',{method:'POST',headers:{'Content-Type':'application/json','X-Auth':tok()},body:JSON.stringify(Object.assign({action:action},extra||{}))}).then(function(r){return r.json();});}
+function enterShell(){$('login').style.display='none';$('shell').style.display='flex';}
+function showLogin(){$('login').style.display='';$('shell').style.display='none';}
+function login(){$('lerr').textContent='';fetch('admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('lu').value,password:$('lp').value})}).then(function(r){return r.json();}).then(function(d){if(d.ok){try{localStorage.setItem('zadm_tok',d.token||'');}catch(e){}enterShell();load();startAuto();}else $('lerr').textContent=d.error||'Wrong username or password';});}
+function logout(){var t=tok();try{localStorage.removeItem('zadm_tok');}catch(e){}if(__auto){clearInterval(__auto);__auto=null;}fetch('admin/logout',{method:'POST',headers:{'X-Auth':t}}).then(function(){location.reload();}).catch(function(){location.reload();});}
 function startAuto(){if(__auto)return;__auto=setInterval(function(){load();},30000);}
-function load(){api('state').then(function(d){if(d.error){if(__auto){clearInterval(__auto);__auto=null;}$('login').style.display='';$('shell').style.display='none';return;}S=d;ROLE=d.role;applyRole();render();});}
+function load(){api('state').then(function(d){if(d.error){try{localStorage.removeItem('zadm_tok');}catch(e){}if(__auto){clearInterval(__auto);__auto=null;}showLogin();return;}S=d;ROLE=d.role;applyRole();render();});}
 function applyRole(){
   $('rolechip').textContent=ROLE==='admin'?'Administrator':'Reseller';
   var admOnly=['modes'];var showModesEdit=(ROLE==='admin');
@@ -648,6 +652,8 @@ function changeMyPass(){api('changeMyPass',{username:$('setUn').value,oldpass:$(
 function exportCsv(){var devs=S.devices||{},rows=[['MAC','Note','App','Plan','Expiry','Status','By']];
   Object.keys(devs).forEach(function(m){var d=devs[m];rows.push([m,(d.note||'').replace(/,/g,' '),d.app,d.plan,d.expires?fmt(d.expires):'Lifetime',classify(d),(d.activated_by==='admin'?'Admin':((S.accounts[d.activated_by]&&S.accounts[d.activated_by].name)||d.activated_by||''))]);});
   var csv=rows.map(function(r){return r.join(',');}).join('\\n');var a=document.createElement('a');a.href='data:text/csv;charset=utf-8,'+encodeURIComponent(csv);a.download='zayron-customers.csv';a.click();}
+/* restore session on refresh — token lives in localStorage, sent as X-Auth header (Cloudflare-proof) */
+(function boot(){if(tok()){enterShell();load();startAuto();}})();
 </script>
 </body></html>`.replace(/SVGLOGO/g,'<svg viewBox="0 0 64 64" style="width:100%;height:100%"><defs><linearGradient id="zg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#63e2ff"/><stop offset="1" stop-color="#0e7fc0"/></linearGradient></defs><circle cx="32" cy="32" r="28" fill="none" stroke="url(#zg)" stroke-width="5"/><polygon points="26,20 44,20 30,44 46,44 46,50 20,50 34,26 26,26" fill="url(#zg)" stroke="none"/></svg>');
 
