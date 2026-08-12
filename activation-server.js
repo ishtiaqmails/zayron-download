@@ -160,84 +160,383 @@ const server = http.createServer(async (req, res) => {
   res.writeHead(404); res.end('not found');
 });
 
-// ---------- admin panel HTML (single page) ----------
+// ---------- admin panel HTML (single page, light Hot-Player-style dashboard) ----------
 const PANEL = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Zayron — Activation Admin</title><style>
-:root{--cyan:#25b6ff;--cb:#63e2ff;--bg:#05080f;--card:#0e1a30;--line:rgba(140,185,245,.16);--muted:#93a6c4;--gold:#f4c33c}
-*{box-sizing:border-box;font-family:'Segoe UI',Arial,sans-serif}body{margin:0;background:var(--bg);color:#eaf2fb}
-.wrap{max-width:1000px;margin:0 auto;padding:18px}
-h1{font-size:20px}h1 b{color:var(--cb)}
-.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px;margin:14px 0}
-.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-input,select{padding:9px 11px;border-radius:9px;border:1px solid var(--line);background:#0a1424;color:#fff;font-size:14px}
-button{padding:9px 15px;border-radius:9px;border:0;background:var(--cyan);color:#fff;font-weight:700;cursor:pointer;font-size:14px}
-button.g{background:rgba(255,255,255,.08);border:1px solid var(--line);color:#dbe8fa}
-button.d{background:#e5546e}
-table{width:100%;border-collapse:collapse;margin-top:8px}th,td{text-align:left;padding:8px;border-bottom:1px solid var(--line);font-size:13px}
-th{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px}
-.tag{font-size:11px;font-weight:700;padding:2px 8px;border-radius:20px}
-.tag.on{background:rgba(0,200,83,.15);color:#22c55e}.tag.off{background:rgba(229,84,110,.15);color:#e5546e}
-.sw{display:inline-flex;align-items:center;gap:6px;margin:4px 12px 4px 0;font-size:13px}
-.muted{color:var(--muted);font-size:12px}label{font-size:12.5px;color:var(--muted)}
-</style></head><body><div class="wrap">
-<h1><b>Zayron</b> Activation — Admin</h1>
-<div id="login" class="card"><div class="row"><input id="key" type="password" placeholder="Admin key" style="flex:1"><button onclick="login()">Sign in</button></div><div id="lerr" class="muted"></div></div>
-<div id="app" style="display:none">
-  <div class="card"><b>Player mode</b> — turn each app Paid or Free, or kill it.
-    <div id="toggles" style="margin-top:10px"></div>
-    <div class="row" style="margin-top:8px"><label>Trial days (0 = off)</label><input id="trial" type="number" style="width:90px"><label>Contact text</label><input id="contact" style="flex:1"><button onclick="saveCfg()">Save</button></div>
-  </div>
-  <div class="card"><b>Activate a device</b>
-    <div class="row" style="margin-top:10px">
-      <input id="amac" placeholder="Device MAC (1A:2B:...)" style="flex:1">
-      <select id="aapp"><option value="any">Any app</option><option value="windows">Windows</option><option value="android">Android</option><option value="ios">iOS</option></select>
-      <select id="aplan"><option value="1y">1 Year (1 credit)</option><option value="lifetime">Lifetime (2 credits)</option></select>
-      <select id="aby"><option value="admin">As Admin (free)</option></select>
-      <button onclick="act()">Activate</button>
-    </div><div id="aerr" class="muted"></div>
-  </div>
-  <div class="card"><div class="row"><b style="flex:1">Devices</b><input id="q" placeholder="search MAC" oninput="render()" style="width:200px"></div>
-    <table id="devs"></table>
-  </div>
-  <div class="card"><b>Resellers &amp; credits</b>
-    <div class="row" style="margin-top:10px"><input id="rname" placeholder="New reseller name"><button onclick="addR()">Add reseller</button></div>
-    <table id="res"></table>
-  </div>
-  <div class="card"><div class="row"><label>Change admin key</label><input id="nkey" placeholder="new key (min 6)"><button class="g" onclick="setKey()">Update key</button></div></div>
-</div>
-<script>
-var S={};
-function post(action,extra){return fetch('admin/act',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({action:action},extra||{}))}).then(function(r){return r.json();});}
-function login(){fetch('admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:document.getElementById('key').value})}).then(function(r){return r.json();}).then(function(d){if(d.ok){document.getElementById('login').style.display='none';document.getElementById('app').style.display='';load();}else document.getElementById('lerr').textContent='Wrong key';});}
-function load(){post('state').then(function(d){if(d.error){document.getElementById('login').style.display='';document.getElementById('app').style.display='none';return;}S=d;render();});}
-function render(){
-  var c=S.config;
-  var apps=['windows','android','ios'];var h='';
-  apps.forEach(function(a){h+='<span class="sw">'+a.toUpperCase()+': <button class="'+(c.paid[a]?'':'g')+'" onclick="tog(\\''+a+'\\',\\'paid\\')">'+(c.paid[a]?'PAID':'FREE')+'</button> <button class="'+(c.kill[a]?'d':'g')+'" onclick="tog(\\''+a+'\\',\\'kill\\')">'+(c.kill[a]?'KILLED':'live')+'</button></span>';});
-  document.getElementById('toggles').innerHTML=h;
-  document.getElementById('trial').value=c.trial_days||0;document.getElementById('contact').value=c.contact||'';
-  // reseller options in activate
-  var aby=document.getElementById('aby');var cur=aby.value;aby.innerHTML='<option value="admin">As Admin (free)</option>';Object.keys(S.resellers).forEach(function(id){var r=S.resellers[id];aby.innerHTML+='<option value="'+id+'">'+r.name+' ('+r.credits+' cr)</option>';});aby.value=cur;
-  // devices
-  var q=(document.getElementById('q').value||'').toUpperCase();
-  var t='<tr><th>MAC</th><th>App</th><th>Plan</th><th>Expires</th><th>By</th><th>Status</th><th></th></tr>';
-  Object.keys(S.devices).filter(function(m){return m.indexOf(q)>=0;}).forEach(function(m){var d=S.devices[m];var exp=d.expires?new Date(d.expires).toISOString().slice(0,10):'Lifetime';
-    t+='<tr><td>'+m+'</td><td>'+d.app+'</td><td>'+d.plan+'</td><td>'+exp+'</td><td>'+d.activated_by+'</td><td><span class="tag '+(d.status==='active'?'on':'off')+'">'+d.status+'</span></td><td>'+(d.status==='blocked'?'<button class="g" onclick="dev(\\'unblock\\',\\''+m+'\\')">unblock</button>':'<button class="g" onclick="dev(\\'block\\',\\''+m+'\\')">block</button>')+' <button class="d" onclick="dev(\\'delete\\',\\''+m+'\\')">del</button></td></tr>';});
-  document.getElementById('devs').innerHTML=t;
-  // resellers
-  var r='<tr><th>Name</th><th>Key</th><th>Credits</th><th>Status</th><th>Add credits</th></tr>';
-  Object.keys(S.resellers).forEach(function(id){var x=S.resellers[id];r+='<tr><td>'+x.name+'</td><td class="muted">'+x.key+'</td><td>'+x.credits+'</td><td><button class="'+(x.enabled?'':'g')+'" onclick="post(\\'toggleReseller\\',{id:\\''+id+'\\'}).then(load)">'+(x.enabled?'enabled':'disabled')+'</button></td><td><input id="cr_'+id+'" type="number" style="width:70px" placeholder="+/-"> <button class="g" onclick="addCr(\\''+id+'\\')">apply</button></td></tr>';});
-  document.getElementById('res').innerHTML=r;
+:root{
+  --navy:#0e2a4f; --navy2:#123a6b; --cyan:#1fa6e8; --cb:#25b6ff; --cyd:#0e7fc0;
+  --bg:#eef3f9; --card:#ffffff; --line:#e4ebf3; --text:#14263f; --muted:#6f8098;
+  --green:#12a150; --greenbg:#e7f7ee; --red:#e5546e; --redbg:#fdecef; --amber:#c9860a; --amberbg:#fdf3e0;
 }
-function tog(a,kind){var c=S.config;c[kind][a]=!c[kind][a];post('setConfig',{config:c}).then(load);}
-function saveCfg(){var c=S.config;c.trial_days=parseInt(document.getElementById('trial').value)||0;c.contact=document.getElementById('contact').value;post('setConfig',{config:c}).then(function(){alert('Saved');load();});}
-function act(){post('activate',{mac:document.getElementById('amac').value,app:document.getElementById('aapp').value,plan:document.getElementById('aplan').value,by:document.getElementById('aby').value}).then(function(d){document.getElementById('aerr').textContent=d.ok?'Activated ✓':('Error: '+d.error);load();});}
-function dev(action,m){if(action==='delete'&&!confirm('Delete '+m+'?'))return;post(action,{mac:m}).then(load);}
-function addR(){var n=document.getElementById('rname').value.trim();if(!n)return;post('reseller',{name:n}).then(function(){document.getElementById('rname').value='';load();});}
-function addCr(id){var v=document.getElementById('cr_'+id).value;post('credits',{id:id,amount:v}).then(load);}
-function setKey(){var k=document.getElementById('nkey').value;post('setAdminKey',{key:k}).then(function(d){alert(d.ok?'Key updated':'Error: '+(d.error||''));});}
-load();
-</script></div></body></html>`;
+*{box-sizing:border-box;font-family:'Segoe UI',Roboto,-apple-system,Arial,sans-serif}
+html,body{margin:0;height:100%}
+body{background:var(--bg);color:var(--text)}
+svg{fill:none;stroke:currentColor;stroke-width:1.9;stroke-linecap:round;stroke-linejoin:round}
+
+/* ---- login ---- */
+.loginwrap{min-height:100vh;display:flex;align-items:center;justify-content:center;
+  background:radial-gradient(80% 60% at 50% 0,rgba(31,166,232,.18),transparent 60%),var(--bg)}
+.loginbox{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:34px 30px;width:340px;
+  box-shadow:0 24px 60px rgba(20,50,90,.14);text-align:center}
+.loginbox .lgo{width:64px;height:64px;margin:0 auto 14px}
+.loginbox h2{margin:2px 0 2px;font-size:20px}.loginbox h2 b{color:var(--cyd)}
+.loginbox p{margin:0 0 16px;color:var(--muted);font-size:13px}
+.loginbox input{width:100%;padding:12px 13px;border-radius:11px;border:1px solid var(--line);background:#f7fafd;font-size:15px;margin-bottom:10px}
+.loginbox button{width:100%;padding:12px;border:0;border-radius:11px;background:var(--cyan);color:#fff;font-weight:700;font-size:15px;cursor:pointer}
+.loginbox button:hover{background:var(--cyd)}
+.err{color:var(--red);font-size:12.5px;margin-top:8px;min-height:16px}
+
+/* ---- shell ---- */
+.shell{display:flex;min-height:100vh}
+.side{width:230px;flex:none;background:linear-gradient(180deg,var(--navy),#0a2244);color:#dbe8fa;display:flex;flex-direction:column;padding:20px 14px}
+.side .brand{display:flex;align-items:center;gap:11px;padding:6px 8px 18px}
+.side .brand .lgo{width:40px;height:40px;flex:none}
+.side .brand .bt b{display:block;font-size:17px;font-weight:800;letter-spacing:2px;line-height:1;color:#fff}
+.side .brand .bt span{font-size:9px;letter-spacing:3px;color:var(--cb);font-weight:700}
+.side nav{display:flex;flex-direction:column;gap:3px;margin-top:6px}
+.navi{display:flex;align-items:center;gap:12px;padding:11px 13px;border-radius:11px;cursor:pointer;color:#b8cbe6;font-size:14px;font-weight:600;transition:.14s}
+.navi svg{width:19px;height:19px}
+.navi:hover{background:rgba(255,255,255,.07);color:#fff}
+.navi.on{background:linear-gradient(90deg,var(--cyan),var(--cyd));color:#fff;box-shadow:0 8px 20px rgba(31,166,232,.35)}
+.side .foot{margin-top:auto;padding:12px 10px 2px;font-size:11px;color:#7d94b6;border-top:1px solid rgba(255,255,255,.08)}
+.side .foot b{color:var(--cb)}
+
+.main{flex:1;min-width:0;display:flex;flex-direction:column}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:18px 26px;background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+.topbar #ptitle{font-size:19px;font-weight:800}
+.topbar .right{display:flex;align-items:center;gap:12px}
+.credits{display:flex;align-items:center;gap:10px;background:linear-gradient(90deg,var(--navy),var(--navy2));color:#fff;
+  padding:9px 15px;border-radius:12px;font-size:11px;font-weight:700;letter-spacing:.6px}
+.credits b{font-size:18px;color:var(--cb);letter-spacing:0}
+.logout{padding:9px 13px;border-radius:10px;border:1px solid var(--line);background:#f7fafd;color:var(--muted);font-weight:700;font-size:13px;cursor:pointer}
+
+.content{padding:22px 26px;overflow:auto}
+.view[hidden]{display:none}
+
+/* cards / stats */
+.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:20px}
+.stat{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:18px 18px;box-shadow:0 6px 20px rgba(20,50,90,.05)}
+.stat .lbl{display:flex;align-items:center;gap:9px;color:var(--muted);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+.stat .lbl .ci{width:34px;height:34px;border-radius:10px;display:flex;align-items:center;justify-content:center}
+.stat .num{font-size:30px;font-weight:800;margin-top:10px}
+.ci.cy{background:rgba(31,166,232,.14);color:var(--cyd)}
+.ci.gr{background:var(--greenbg);color:var(--green)}
+.ci.am{background:var(--amberbg);color:var(--amber)}
+.ci.rd{background:var(--redbg);color:var(--red)}
+
+.card{background:var(--card);border:1px solid var(--line);border-radius:16px;padding:20px;margin-bottom:20px;box-shadow:0 6px 20px rgba(20,50,90,.05)}
+.card h3{margin:0 0 4px;font-size:16px}
+.card .sub{color:var(--muted);font-size:12.5px;margin-bottom:14px}
+.row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+label{font-size:12.5px;color:var(--muted);font-weight:600}
+input,select{padding:10px 12px;border-radius:10px;border:1px solid var(--line);background:#f7fafd;color:var(--text);font-size:14px}
+input:focus,select:focus{outline:0;border-color:var(--cyan);background:#fff}
+button{padding:10px 16px;border-radius:10px;border:0;background:var(--cyan);color:#fff;font-weight:700;cursor:pointer;font-size:14px}
+button:hover{background:var(--cyd)}
+button.g{background:#eef3f9;border:1px solid var(--line);color:#455872}
+button.g:hover{background:#e2e9f2}
+button.d{background:var(--red)}button.d:hover{background:#cf3f59}
+button.sm{padding:6px 11px;font-size:12.5px;border-radius:8px}
+
+.filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:6px}
+.chip{padding:8px 14px;border-radius:20px;border:1px solid var(--line);background:#f7fafd;color:var(--muted);font-size:12.5px;font-weight:700;cursor:pointer}
+.chip.on{background:var(--navy);color:#fff;border-color:var(--navy)}
+.grow{flex:1;min-width:120px}
+
+table{width:100%;border-collapse:collapse;margin-top:12px}
+th,td{text-align:left;padding:11px 10px;border-bottom:1px solid var(--line);font-size:13px;vertical-align:middle}
+th{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.6px;font-weight:700}
+tbody tr:hover{background:#f7fafd}
+.mono{font-family:'SF Mono',Consolas,monospace;font-weight:600;letter-spacing:.3px}
+.tag{font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px;display:inline-block}
+.tag.on{background:var(--greenbg);color:var(--green)}
+.tag.off{background:var(--redbg);color:var(--red)}
+.tag.soon{background:var(--amberbg);color:var(--amber)}
+.tag.life{background:rgba(31,166,232,.14);color:var(--cyd)}
+.empty{text-align:center;color:var(--muted);padding:26px;font-size:13.5px}
+
+/* player mode toggles */
+.modewrap{display:grid;grid-template-columns:repeat(3,1fr);gap:14px;margin-top:6px}
+.modecard{border:1px solid var(--line);border-radius:14px;padding:16px;background:#f9fbfe}
+.modecard h4{margin:0 0 12px;font-size:14px;display:flex;align-items:center;gap:8px}
+.modecard .mrow{display:flex;align-items:center;justify-content:space-between;margin:9px 0}
+.modecard .mrow span{font-size:12.5px;color:var(--muted);font-weight:600}
+.pill{padding:6px 13px;border-radius:20px;font-size:12px;font-weight:700;cursor:pointer;border:0;min-width:78px}
+.pill.paid{background:var(--cyan);color:#fff}.pill.free{background:#eef3f9;color:#455872;border:1px solid var(--line)}
+.pill.killed{background:var(--red);color:#fff}.pill.live{background:var(--greenbg);color:var(--green)}
+.note{font-size:12.5px;color:var(--muted);margin-top:6px}
+.ok{color:var(--green);font-weight:700}
+.big{font-size:22px;font-weight:800;letter-spacing:1px}
+.lookup{background:#f9fbfe;border:1px dashed var(--line);border-radius:14px;padding:18px;margin-top:14px;font-size:14px}
+.lookup .k{color:var(--muted);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}
+@media(max-width:820px){.side{width:64px;padding:16px 8px}.side .brand .bt,.side .navi span,.side .foot{display:none}.navi{justify-content:center}.stats{grid-template-columns:repeat(2,1fr)}.modewrap{grid-template-columns:1fr}}
+</style></head><body>
+
+<div id="login" class="loginwrap">
+  <div class="loginbox">
+    <div class="lgo">SVGLOGO</div>
+    <h2><b>Zayron</b> Activation</h2>
+    <p>Admin sign in</p>
+    <input id="key" type="password" placeholder="Admin key" onkeydown="if(event.key==='Enter')login()">
+    <button onclick="login()">Sign in</button>
+    <div id="lerr" class="err"></div>
+  </div>
+</div>
+
+<div id="shell" class="shell" style="display:none">
+  <aside class="side">
+    <div class="brand"><div class="lgo">SVGLOGO</div><div class="bt"><b>ZAYRON</b><span>ADMIN PANEL</span></div></div>
+    <nav id="nav">
+      <div class="navi on" data-view="dash"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span>Dashboard</span></div>
+      <div class="navi" data-view="cust"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 20c0-3.3 2.7-5 5.5-5s5.5 1.7 5.5 5"/><path d="M17 9.5a2.7 2.7 0 1 0-1-5.2M20.5 20c0-2.6-1.6-4.2-3.5-4.7"/></svg><span>Customers</span></div>
+      <div class="navi" data-view="activate"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg><span>Activate</span></div>
+      <div class="navi" data-view="check"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.2-3.2"/></svg><span>Check MAC</span></div>
+      <div class="navi" data-view="res"><svg viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="13" rx="2"/><path d="M3 10h18M8 3v3M16 3v3"/></svg><span>Resellers</span></div>
+      <div class="navi" data-view="modes"><svg viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="8" cy="12" r="2.4"/><path d="M14 10h4M14 14h4"/></svg><span>Player Modes</span></div>
+      <div class="navi" data-view="settings"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 13a7.6 7.6 0 0 0 0-2l2-1.5-2-3.4-2.3 1a7.3 7.3 0 0 0-1.7-1L15 3h-4l-.4 2.6a7.3 7.3 0 0 0-1.7 1l-2.3-1-2 3.4 2 1.5a7.6 7.6 0 0 0 0 2l-2 1.5 2 3.4 2.3-1a7.3 7.3 0 0 0 1.7 1l.4 2.6h4l.4-2.6a7.3 7.3 0 0 0 1.7-1l2.3 1 2-3.4z"/></svg><span>Settings</span></div>
+    </nav>
+    <div class="foot">Signed in as Admin<br><b>zayron.tv</b></div>
+  </aside>
+
+  <div class="main">
+    <div class="topbar">
+      <div id="ptitle">Dashboard</div>
+      <div class="right">
+        <div class="credits">CREDITS IN CIRCULATION <b id="credtot">0</b></div>
+        <button class="logout" onclick="location.reload()">Refresh</button>
+      </div>
+    </div>
+    <div class="content">
+
+      <!-- DASHBOARD -->
+      <section id="v-dash" class="view">
+        <div class="stats">
+          <div class="stat"><div class="lbl"><span class="ci cy"><svg viewBox="0 0 24 24" style="width:18px;height:18px"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M8 21h8"/></svg></span>Total devices</div><div class="num" id="s_total">0</div></div>
+          <div class="stat"><div class="lbl"><span class="ci gr"><svg viewBox="0 0 24 24" style="width:18px;height:18px"><path d="M20 6L9 17l-5-5"/></svg></span>Active</div><div class="num" id="s_active">0</div></div>
+          <div class="stat"><div class="lbl"><span class="ci am"><svg viewBox="0 0 24 24" style="width:18px;height:18px"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>Expiring soon</div><div class="num" id="s_soon">0</div></div>
+          <div class="stat"><div class="lbl"><span class="ci rd"><svg viewBox="0 0 24 24" style="width:18px;height:18px"><circle cx="12" cy="12" r="9"/><path d="M15 9l-6 6M9 9l6 6"/></svg></span>Expired / blocked</div><div class="num" id="s_dead">0</div></div>
+        </div>
+        <div class="stats" style="grid-template-columns:repeat(3,1fr)">
+          <div class="stat"><div class="lbl"><span class="ci cy"><svg viewBox="0 0 24 24" style="width:18px;height:18px"><circle cx="9" cy="8" r="3"/><path d="M3.5 19c0-3 2.5-4.5 5.5-4.5s5.5 1.5 5.5 4.5"/></svg></span>Resellers</div><div class="num" id="s_res">0</div></div>
+          <div class="stat"><div class="lbl"><span class="ci am"><svg viewBox="0 0 24 24" style="width:18px;height:18px"><rect x="3" y="6" width="18" height="13" rx="2"/><path d="M3 10h18"/></svg></span>Credits in circulation</div><div class="num" id="s_cred">0</div></div>
+          <div class="stat"><div class="lbl"><span class="ci gr"><svg viewBox="0 0 24 24" style="width:18px;height:18px"><path d="M4 17l5-5 3 3 7-8"/></svg></span>Lifetime devices</div><div class="num" id="s_life">0</div></div>
+        </div>
+        <div class="card">
+          <h3>Recent activity</h3>
+          <div class="sub">Latest activations, renewals and credit changes.</div>
+          <table id="ledger"></table>
+        </div>
+      </section>
+
+      <!-- CUSTOMERS -->
+      <section id="v-cust" class="view" hidden>
+        <div class="card">
+          <div class="row" style="justify-content:space-between">
+            <div><h3 style="margin:0">Customers / Devices</h3><div class="sub" style="margin:2px 0 0">Every activated MAC, its plan and expiry.</div></div>
+            <button onclick="go('activate')">+ New activation</button>
+          </div>
+          <div class="filters" style="margin-top:14px">
+            <div class="chip on" data-f="all">All</div>
+            <div class="chip" data-f="active">Active</div>
+            <div class="chip" data-f="soon">Expires soon</div>
+            <div class="chip" data-f="expired">Expired</div>
+            <div class="chip" data-f="blocked">Blocked</div>
+            <input id="q" class="grow" placeholder="Search MAC or note…" oninput="render()" style="min-width:180px">
+          </div>
+          <table id="devs"></table>
+        </div>
+      </section>
+
+      <!-- ACTIVATE -->
+      <section id="v-activate" class="view" hidden>
+        <div class="card" style="max-width:640px">
+          <h3>Activate a device</h3>
+          <div class="sub">1 credit = 1 year · 2 credits = lifetime. As Admin activations are free.</div>
+          <div class="row" style="margin-bottom:10px"><label style="width:120px">Device MAC</label><input id="amac" class="grow" placeholder="1A:2B:3C:4D:5E:6F"></div>
+          <div class="row" style="margin-bottom:10px"><label style="width:120px">Note (optional)</label><input id="anote" class="grow" placeholder="Customer name / phone"></div>
+          <div class="row" style="margin-bottom:10px"><label style="width:120px">App</label>
+            <select id="aapp" class="grow"><option value="any">Any app</option><option value="windows">Windows</option><option value="android">Android</option><option value="ios">iOS</option></select></div>
+          <div class="row" style="margin-bottom:10px"><label style="width:120px">Plan</label>
+            <select id="aplan" class="grow"><option value="1y">1 Year (1 credit)</option><option value="lifetime">Lifetime (2 credits)</option></select></div>
+          <div class="row" style="margin-bottom:14px"><label style="width:120px">Activated by</label>
+            <select id="aby" class="grow"><option value="admin">As Admin (free)</option></select></div>
+          <button onclick="act()">Activate device</button>
+          <div id="aerr" class="note"></div>
+        </div>
+      </section>
+
+      <!-- CHECK MAC -->
+      <section id="v-check" class="view" hidden>
+        <div class="card" style="max-width:640px">
+          <h3>Check a MAC</h3>
+          <div class="sub">Look up any device to see its plan, expiry and who sold it.</div>
+          <div class="row"><input id="cmac" class="grow" placeholder="Enter device MAC…"><button onclick="checkMac()">Look up</button></div>
+          <div id="cres"></div>
+        </div>
+      </section>
+
+      <!-- RESELLERS -->
+      <section id="v-res" class="view" hidden>
+        <div class="card">
+          <div class="row" style="justify-content:space-between">
+            <div><h3 style="margin:0">Resellers &amp; credits</h3><div class="sub" style="margin:2px 0 0">Add resellers, issue credits, enable or disable.</div></div>
+          </div>
+          <div class="row" style="margin-top:12px"><input id="rname" placeholder="New reseller name" class="grow"><button onclick="addR()">+ Add reseller</button></div>
+          <table id="res"></table>
+        </div>
+      </section>
+
+      <!-- PLAYER MODES -->
+      <section id="v-modes" class="view" hidden>
+        <div class="card">
+          <h3>Player modes</h3>
+          <div class="sub">Turn each app Paid or Free, or kill it instantly. Free = nobody is blocked.</div>
+          <div class="modewrap" id="modes"></div>
+          <div class="row" style="margin-top:18px"><label style="width:150px">Free trial (days, 0 = off)</label><input id="trial" type="number" style="width:100px"></div>
+          <div class="row" style="margin-top:10px"><label style="width:150px">Contact text (shown on block)</label><input id="contact" class="grow"></div>
+          <div class="row" style="margin-top:14px"><button onclick="saveCfg()">Save settings</button><span id="cfgok" class="ok"></span></div>
+        </div>
+      </section>
+
+      <!-- SETTINGS -->
+      <section id="v-settings" class="view" hidden>
+        <div class="card" style="max-width:520px">
+          <h3>Change admin key</h3>
+          <div class="sub">Use a long, private key. This replaces your current sign-in key immediately.</div>
+          <div class="row"><input id="nkey" placeholder="New admin key (min 6 chars)" class="grow"><button class="g" onclick="setKey()">Update key</button></div>
+          <div id="kok" class="note"></div>
+        </div>
+      </section>
+
+    </div>
+  </div>
+</div>
+
+<script>
+var S={},FILTER='all',SOON=14*24*3600*1000;
+function post(action,extra){return fetch('admin/act',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(Object.assign({action:action},extra||{}))}).then(function(r){return r.json();});}
+function $(id){return document.getElementById(id);}
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c];});}
+function login(){
+  fetch('admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:$('key').value})})
+  .then(function(r){return r.json();})
+  .then(function(d){if(d.ok){$('login').style.display='none';$('shell').style.display='flex';load();}else $('lerr').textContent='Wrong key — try again';});
+}
+function load(){post('state').then(function(d){if(d.error){$('login').style.display='';$('shell').style.display='none';return;}S=d;render();});}
+function go(view){
+  var items=document.querySelectorAll('.navi');for(var i=0;i<items.length;i++)items[i].classList.toggle('on',items[i].getAttribute('data-view')===view);
+  var secs=document.querySelectorAll('.view');for(var j=0;j<secs.length;j++)secs[j].hidden=(secs[j].id!=='v-'+view);
+  var t={dash:'Dashboard',cust:'Customers / Devices',activate:'Activate a device',check:'Check MAC',res:'Resellers & credits',modes:'Player modes',settings:'Settings'};
+  $('ptitle').textContent=t[view]||'Dashboard';
+}
+document.getElementById('nav').addEventListener('click',function(e){var n=e.target.closest('.navi');if(n)go(n.getAttribute('data-view'));});
+document.querySelector('.filters').addEventListener('click',function(e){var c=e.target.closest('.chip');if(!c)return;FILTER=c.getAttribute('data-f');var ch=document.querySelectorAll('.chip');for(var i=0;i<ch.length;i++)ch[i].classList.toggle('on',ch[i]===c);render();});
+
+function expOf(d){return (d.plan==='lifetime'||d.expires==null)?null:d.expires;}
+function classify(d){
+  if(d.status==='blocked')return 'blocked';
+  var e=expOf(d);
+  if(e==null)return 'active';
+  if(e<=Date.now())return 'expired';
+  if(e-Date.now()<=SOON)return 'soon';
+  return 'active';
+}
+function fmt(ts){if(ts==null)return 'Lifetime';var x=new Date(ts);return x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0');}
+function daysLeft(ts){if(ts==null)return '∞';var d=Math.ceil((ts-Date.now())/86400000);return d+' d';}
+
+function render(){
+  var c=S.config,devs=S.devices||{},res=S.resellers||{};
+  var macs=Object.keys(devs);
+  // stats
+  var st={total:macs.length,active:0,soon:0,dead:0,life:0};
+  macs.forEach(function(m){var cl=classify(devs[m]);if(cl==='active')st.active++;if(cl==='soon'){st.soon++;st.active++;}if(cl==='expired'||cl==='blocked')st.dead++;if(expOf(devs[m])==null&&devs[m].status!=='blocked')st.life++;});
+  var credtot=0;Object.keys(res).forEach(function(id){credtot+=(res[id].credits||0);});
+  $('s_total').textContent=st.total;$('s_active').textContent=st.active;$('s_soon').textContent=st.soon;$('s_dead').textContent=st.dead;
+  $('s_res').textContent=Object.keys(res).length;$('s_cred').textContent=credtot;$('s_life').textContent=st.life;$('credtot').textContent=credtot;
+
+  // ledger
+  var lg=(S.ledger||[]).slice(0,12);var lh='<tr><th>When</th><th>Type</th><th>Reseller</th><th>MAC</th><th>Amount</th></tr>';
+  if(!lg.length)lh+='<tr><td colspan="5" class="empty">No activity yet.</td></tr>';
+  lg.forEach(function(x){var rn=x.reseller==='admin'?'Admin':((res[x.reseller]&&res[x.reseller].name)||x.reseller||'—');
+    lh+='<tr><td>'+fmt(x.ts)+'</td><td>'+esc(x.type)+(x.note?' <span class="note">('+esc(x.note)+')</span>':'')+'</td><td>'+esc(rn)+'</td><td class="mono">'+esc(x.mac||'—')+'</td><td>'+(x.amount>0?'+'+x.amount:x.amount||0)+'</td></tr>';});
+  $('ledger').innerHTML=lh;
+
+  // player modes
+  var apps=['windows','android','ios'];var mh='';
+  apps.forEach(function(a){
+    mh+='<div class="modecard"><h4>'+a.charAt(0).toUpperCase()+a.slice(1)+'</h4>'+
+      '<div class="mrow"><span>Billing</span><button class="pill '+(c.paid[a]?'paid':'free')+'" data-tog="paid" data-app="'+a+'">'+(c.paid[a]?'PAID':'FREE')+'</button></div>'+
+      '<div class="mrow"><span>Availability</span><button class="pill '+(c.kill[a]?'killed':'live')+'" data-tog="kill" data-app="'+a+'">'+(c.kill[a]?'KILLED':'LIVE')+'</button></div></div>';
+  });
+  $('modes').innerHTML=mh;
+  $('trial').value=c.trial_days||0;$('contact').value=c.contact||'';
+
+  // activate reseller dropdown
+  var aby=$('aby');var cur=aby.value;aby.innerHTML='<option value="admin">As Admin (free)</option>';
+  Object.keys(res).forEach(function(id){var r=res[id];aby.innerHTML+='<option value="'+id+'">'+esc(r.name)+' ('+(r.credits||0)+' cr)</option>';});
+  aby.value=cur||'admin';
+
+  // devices table
+  var q=($('q').value||'').toUpperCase();
+  var list=macs.filter(function(m){
+    var d=devs[m];var cl=classify(d);
+    if(FILTER==='soon'&&cl!=='soon')return false;
+    if(FILTER==='active'&&!(cl==='active'||cl==='soon'))return false;
+    if(FILTER==='expired'&&cl!=='expired')return false;
+    if(FILTER==='blocked'&&cl!=='blocked')return false;
+    if(q&&(m.indexOf(q)<0&&String(d.note||'').toUpperCase().indexOf(q)<0))return false;
+    return true;
+  }).sort(function(a,b){return (expOf(devs[a])||9e15)-(expOf(devs[b])||9e15);});
+  var th='<tr><th>MAC</th><th>Note</th><th>App</th><th>Plan</th><th>Expiry</th><th>Left</th><th>By</th><th>Status</th><th></th></tr>';
+  var t=th;
+  if(!list.length)t+='<tr><td colspan="9" class="empty">No devices match this filter.</td></tr>';
+  list.forEach(function(m){var d=devs[m];var cl=classify(d);var e=expOf(d);
+    var tag=cl==='active'?'<span class="tag on">Active</span>':cl==='soon'?'<span class="tag soon">Expires soon</span>':cl==='expired'?'<span class="tag off">Expired</span>':'<span class="tag off">Blocked</span>';
+    var plan=d.plan==='lifetime'?'<span class="tag life">Lifetime</span>':esc(d.plan);
+    var by=d.activated_by==='admin'?'Admin':((res[d.activated_by]&&res[d.activated_by].name)||d.activated_by||'—');
+    var actbtn=d.status==='blocked'?'<button class="g sm" data-act="unblock" data-mac="'+m+'">Unblock</button>':'<button class="g sm" data-act="block" data-mac="'+m+'">Block</button>';
+    t+='<tr><td class="mono">'+m+'</td><td>'+esc(d.note||'—')+'</td><td>'+esc(d.app)+'</td><td>'+plan+'</td><td>'+fmt(e)+'</td><td>'+(cl==='expired'?'—':daysLeft(e))+'</td><td>'+esc(by)+'</td><td>'+tag+'</td><td style="white-space:nowrap"><button class="sm" data-act="renew" data-mac="'+m+'">Renew</button> '+actbtn+' <button class="d sm" data-act="delete" data-mac="'+m+'">Del</button></td></tr>';});
+  $('devs').innerHTML=t;
+
+  // resellers table
+  var rh='<tr><th>Name</th><th>Login key</th><th>Credits</th><th>Status</th><th>Adjust credits</th></tr>';
+  var rk=Object.keys(res);
+  if(!rk.length)rh+='<tr><td colspan="5" class="empty">No resellers yet.</td></tr>';
+  rk.forEach(function(id){var x=res[id];
+    rh+='<tr><td><b>'+esc(x.name)+'</b></td><td class="mono" style="color:var(--muted)">'+esc(x.key)+'</td><td><b>'+(x.credits||0)+'</b></td>'+
+      '<td><button class="'+(x.enabled?'g':'d')+' sm" data-rtog="'+id+'">'+(x.enabled?'Enabled':'Disabled')+'</button></td>'+
+      '<td style="white-space:nowrap"><input id="cr_'+id+'" type="number" style="width:80px" placeholder="+/-"> <button class="g sm" data-rcr="'+id+'">Apply</button></td></tr>';});
+  $('res').innerHTML=rh;
+}
+
+// delegated actions on devices + resellers
+document.addEventListener('click',function(e){
+  var b=e.target.closest('button');if(!b)return;
+  if(b.dataset.tog){var c=S.config;c[b.dataset.tog][b.dataset.app]=!c[b.dataset.tog][b.dataset.app];post('setConfig',{config:c}).then(load);return;}
+  if(b.dataset.act){var m=b.dataset.mac,a=b.dataset.act;
+    if(a==='delete'){if(!confirm('Delete '+m+' ?'))return;post('delete',{mac:m}).then(load);return;}
+    if(a==='renew'){var d=S.devices[m];post('activate',{mac:m,app:d.app,plan:(d.plan==='lifetime'?'lifetime':'1y'),by:'admin',note:d.note}).then(load);return;}
+    post(a,{mac:m}).then(load);return;}
+  if(b.dataset.rtog){post('toggleReseller',{id:b.dataset.rtog}).then(load);return;}
+  if(b.dataset.rcr){var v=$('cr_'+b.dataset.rcr).value;if(v)post('credits',{id:b.dataset.rcr,amount:v}).then(load);return;}
+});
+
+function tog(){}
+function saveCfg(){var c=S.config;c.trial_days=parseInt($('trial').value)||0;c.contact=$('contact').value;post('setConfig',{config:c}).then(function(){$('cfgok').textContent='Saved ✓';setTimeout(function(){$('cfgok').textContent='';},1800);load();});}
+function act(){post('activate',{mac:$('amac').value,app:$('aapp').value,plan:$('aplan').value,by:$('aby').value,note:$('anote').value}).then(function(d){
+  if(d.ok){$('aerr').innerHTML='<span class="ok">Activated ✓</span>';$('amac').value='';$('anote').value='';load();}
+  else $('aerr').innerHTML='<span style="color:var(--red)">Error: '+esc(d.error||'failed')+'</span>';});}
+function checkMac(){var m=($('cmac').value||'').toUpperCase().replace(/[^0-9A-F:]/g,'');var d=S.devices[m];
+  if(!m){$('cres').innerHTML='';return;}
+  if(!d){$('cres').innerHTML='<div class="lookup"><div class="k">Result</div><div class="big" style="color:var(--red)">Not activated</div><div class="note">This MAC has no record. In Paid mode it would be blocked.</div></div>';return;}
+  var cl=classify(d),e=expOf(d);
+  var color=cl==='active'?'var(--green)':cl==='soon'?'var(--amber)':'var(--red)';
+  $('cres').innerHTML='<div class="lookup"><div class="k">'+esc(m)+'</div><div class="big" style="color:'+color+'">'+cl.toUpperCase()+'</div>'+
+    '<div class="note">Plan: <b>'+esc(d.plan)+'</b> · Expiry: <b>'+fmt(e)+'</b> · App: <b>'+esc(d.app)+'</b> · Note: '+esc(d.note||'—')+'</div></div>';}
+function addR(){var n=$('rname').value.trim();if(!n)return;post('reseller',{name:n}).then(function(){$('rname').value='';load();});}
+function setKey(){var k=$('nkey').value;post('setAdminKey',{key:k}).then(function(d){$('kok').innerHTML=d.ok?'<span class="ok">Key updated ✓ — use it next sign-in.</span>':'<span style="color:var(--red)">'+esc(d.error||'error')+'</span>';if(d.ok)$('nkey').value='';});}
+</script>
+</body></html>`.replace(/SVGLOGO/g,'<svg viewBox="0 0 64 64" style="width:100%;height:100%"><defs><linearGradient id="zg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#63e2ff"/><stop offset="1" stop-color="#0e7fc0"/></linearGradient></defs><circle cx="32" cy="32" r="28" fill="none" stroke="url(#zg)" stroke-width="5"/><polygon points="26,20 44,20 30,44 46,44 46,50 20,50 34,26 26,26" fill="url(#zg)" stroke="none"/></svg>');
 
 server.listen(PORT, '127.0.0.1', () => console.log('Zayron activation server on 127.0.0.1:' + PORT));
 
