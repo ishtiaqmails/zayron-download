@@ -396,6 +396,16 @@ th{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.
 .dlc h4{margin:6px 0 4px;font-size:16px}.dlc .qr{width:150px;height:150px;margin:10px auto;border-radius:12px;background:#fff;border:1px solid var(--line)}
 .dlc a.b{display:inline-block;margin-top:8px;padding:10px 18px;border-radius:10px;background:var(--cyan);color:#fff;font-weight:700;text-decoration:none;font-size:13.5px}
 .treerow td:first-child{padding-left:10px}
+.tnode{margin:4px 0}
+.tbar{display:flex;align-items:center;gap:10px;padding:9px 12px;border:1px solid var(--line);border-radius:12px;background:#fff;cursor:grab;transition:.12s}
+.tbar:hover{border-color:var(--cyan);box-shadow:0 6px 16px rgba(31,166,232,.12)}
+.tbar.dragging{opacity:.4}.tbar.drop{border-color:var(--green);background:var(--greenbg);box-shadow:0 0 0 2px var(--green) inset}
+.tbar .tav{width:32px;height:32px;border-radius:9px;background:linear-gradient(160deg,var(--navy),var(--cyd));color:#fff;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:13px;flex:none}
+.tbar .tnm{font-weight:700;font-size:14px}.tbar .tmeta{font-size:11px;color:var(--muted)}
+.tbar .tcr{margin-left:auto;font-weight:800;color:var(--navy);white-space:nowrap;font-size:13px}
+.tbar .tacts{display:flex;gap:5px;flex-wrap:wrap}
+.tkids{list-style:none;margin:0 0 0 26px;padding:0;border-left:2px dashed var(--line)}
+.tdrop-top{border:1.5px dashed var(--cyan);border-radius:12px;padding:9px 12px;text-align:center;color:var(--cyd);font-weight:700;font-size:12.5px;margin-bottom:8px;background:#f5fbff}
 .modalbg{position:fixed;inset:0;background:rgba(14,42,79,.45);display:none;align-items:center;justify-content:center;z-index:50;padding:20px}
 .modalbg.on{display:flex}
 .modal{background:#fff;border-radius:18px;padding:24px;width:100%;max-width:420px;box-shadow:0 30px 80px rgba(0,0,0,.3)}
@@ -489,7 +499,8 @@ th{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.
 
       <section id="v-res" class="view" hidden>
         <div class="card">
-          <div class="row" style="justify-content:space-between"><div><h3 style="margin:0" id="resTitle">Resellers</h3><div class="sub" style="margin:2px 0 0">Create accounts, top up credits, reset passwords.</div></div><button onclick="openCreate()">+ Add account</button></div>
+          <div class="row" style="justify-content:space-between"><div><h3 style="margin:0" id="resTitle">Resellers</h3><div class="sub" style="margin:2px 0 0" id="resSub">Drag any account onto another to move it. Top up credits, reset passwords, control API.</div></div><button onclick="openCreate()">+ Add account</button></div>
+          <ul id="restree" style="list-style:none;margin:12px 0 0;padding:0;display:none"></ul>
           <table id="restab"></table>
         </div>
       </section>
@@ -562,6 +573,7 @@ function applyRole(){
   document.querySelectorAll('.navi').forEach(function(n){var v=n.getAttribute('data-view');if(admOnly.indexOf(v)>=0)n.hidden=(ROLE!=='admin');});
   $('resNav').textContent=ROLE==='admin'?'Resellers':'My sub-resellers';
   $('resTitle').textContent=ROLE==='admin'?'Resellers & sub-resellers':'My sub-resellers';
+  var rs=$('resSub');if(rs)rs.textContent=(ROLE==='admin')?'Drag any account onto another to move it. Top up credits, reset passwords, control API.':'Create sub-resellers under you, top up their credits, reset passwords.';
   // admin-only dashboard blocks
   var admBlocks=[['liveHead',1],['liveStats',1],['byappCard',1],['recentCard',1]];
   admBlocks.forEach(function(x){var el=$(x[0]);if(el)el.style.display=(ROLE==='admin')?'':'none';});
@@ -632,25 +644,69 @@ function renderDevices(){
   $('devs').innerHTML=t;
 }
 function renderResellers(){
+  if(ROLE==='admin'){ $('restab').style.display='none'; $('restree').style.display=''; renderResTree(); return; }
+  $('restree').style.display='none'; $('restab').style.display='';
   var accs=S.accounts||{},ids=Object.keys(accs);
-  // build tree ordered (roots first, then children). roots = parent not in accs (i.e. my direct children)
   var roots=ids.filter(function(id){var p=accs[id].parent;return !p||!accs[p];});
   var out=[];function walk(id,depth){out.push({id:id,depth:depth});ids.filter(function(x){return accs[x].parent===id;}).sort(byName).forEach(function(c){walk(c,depth+1);});}
   function byName(a,b){return (accs[a].name||'').localeCompare(accs[b].name||'');}
   roots.sort(byName).forEach(function(r){walk(r,0);});
-  var adminCol=(ROLE==='admin');
-  var th='<tr><th>Account</th><th>Username</th>'+(adminCol?'<th>Email</th>':'')+'<th>Credits</th><th>Status</th><th>Actions</th></tr>';
+  var th='<tr><th>Account</th><th>Username</th><th>Credits</th><th>Status</th><th>Actions</th></tr>';
   var t=th;
-  if(!out.length)t+='<tr><td colspan="6" class="empty">No accounts yet. Tap “Add account”.</td></tr>';
+  if(!out.length)t+='<tr><td colspan="5" class="empty">No sub-resellers yet. Tap “Add account”.</td></tr>';
   out.forEach(function(n){var a=accs[n.id];var pad=n.depth*18;
     var name='<span style="padding-left:'+pad+'px">'+(n.depth>0?'<span style="color:var(--muted)">↳ </span>':'')+'<b>'+esc(a.name)+'</b>'+(a.children?' <span class="sub" style="margin:0">('+a.children+')</span>':'')+'</span>';
-    var reparent=(ROLE==='admin')?' <button class="g sm" data-reparent="'+n.id+'">Move</button>':'';
-    var del=(ROLE==='admin'&&!a.children)?' <button class="d sm" data-delacc="'+n.id+'">Del</button>':'';
-    var apiBtn=(ROLE==='admin')?' <button class="'+(a.api_enabled?'':'g')+' sm" style="'+(a.api_enabled?'background:var(--violet)':'')+'" data-tapi="'+n.id+'" title="Automation API access">API '+(a.api_enabled?'ON':'off')+'</button>':'';
-    t+='<tr class="treerow"><td>'+name+'</td><td class="mono">'+esc(a.username)+'</td>'+(adminCol?'<td>'+esc(a.email||'—')+'</td>':'')+'<td><b>'+(a.credits||0)+'</b></td>'+
+    t+='<tr class="treerow"><td>'+name+'</td><td class="mono">'+esc(a.username)+'</td><td><b>'+(a.credits||0)+'</b></td>'+
       '<td><button class="'+(a.enabled?'g':'d')+' sm" data-tacc="'+n.id+'">'+(a.enabled?'Enabled':'Disabled')+'</button></td>'+
-      '<td style="white-space:nowrap"><button class="sm" data-topup="'+n.id+'">Credits</button> <button class="g sm" data-reset="'+n.id+'">Password</button>'+apiBtn+reparent+del+'</td></tr>';});
+      '<td style="white-space:nowrap"><button class="sm" data-topup="'+n.id+'">Credits</button> <button class="g sm" data-reset="'+n.id+'">Password</button></td></tr>';});
   $('restab').innerHTML=t;
+}
+// ADMIN ONLY — full drag-and-drop tree. Drop an account onto another to move it (uses the reparent action).
+function acInit(nm){return String(nm||'?').split(' ').map(function(w){return w[0]||'';}).join('').slice(0,2).toUpperCase();}
+function renderResTree(){
+  var accs=S.accounts||{},ids=Object.keys(accs);
+  function kids(pid){return ids.filter(function(id){return (accs[id].parent||null)===pid;}).sort(function(a,b){return (accs[a].name||'').localeCompare(accs[b].name||'');});}
+  function node(id){var a=accs[id];var ck=kids(id);
+    var tier=(!a.parent)?'Master':(accs[a.parent]&&!accs[a.parent].parent?'Reseller':'Sub');
+    var tcol=tier==='Master'?'var(--violet)':tier==='Reseller'?'var(--cyd)':'#94a3b8';
+    var h='<li class="tnode"><div class="tbar" draggable="true" data-id="'+id+'">'+
+      '<span class="tav">'+esc(acInit(a.name))+'</span>'+
+      '<span><span class="tnm">'+esc(a.name)+' <span class="tag" style="background:'+tcol+';color:#fff;font-size:9px;padding:2px 7px">'+tier+'</span></span><div class="tmeta">@'+esc(a.username)+(ck.length?(' · '+ck.length+' sub'):'')+(a.enabled?'':' · <span style="color:var(--red)">disabled</span>')+'</div></span>'+
+      '<span class="tcr">'+(a.credits||0)+' cr</span>'+
+      '<span class="tacts">'+
+        '<button class="sm" data-topup="'+id+'">Credits</button>'+
+        '<button class="g sm" data-reset="'+id+'">Pass</button>'+
+        '<button class="'+(a.api_enabled?'':'g')+' sm" style="'+(a.api_enabled?'background:var(--violet)':'')+'" data-tapi="'+id+'">API '+(a.api_enabled?'ON':'off')+'</button>'+
+        '<button class="'+(a.enabled?'g':'d')+' sm" data-tacc="'+id+'">'+(a.enabled?'On':'Off')+'</button>'+
+        (a.children?'':'<button class="d sm" data-delacc="'+id+'">Del</button>')+
+      '</span></div>';
+    if(ck.length){h+='<ul class="tkids">'+ck.map(node).join('')+'</ul>';}
+    return h+'</li>';}
+  var roots=ids.filter(function(id){return !accs[id].parent||!accs[accs[id].parent];}).sort(function(a,b){return (accs[a].name||'').localeCompare(accs[b].name||'');});
+  var html='<div class="tdrop-top" data-droptop="1">⇧ Drop here to make an account top-level (Master)</div>';
+  html+= roots.length?roots.map(node).join(''):'<div class="empty">No accounts yet. Tap “Add account”.</div>';
+  $('restree').innerHTML=html;
+  bindResTreeDnD();
+}
+var __dragId=null;
+function isDescId(anc,id){var cur=id,g=0;var accs=S.accounts||{};while(cur&&g++<200){if(cur===anc)return true;cur=accs[cur]?accs[cur].parent:null;}return false;}
+function bindResTreeDnD(){
+  var bars=document.querySelectorAll('#restree .tbar');
+  bars.forEach(function(bar){
+    bar.addEventListener('dragstart',function(e){__dragId=bar.getAttribute('data-id');bar.classList.add('dragging');try{e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text','x');}catch(_){}});
+    bar.addEventListener('dragend',function(){bar.classList.remove('dragging');document.querySelectorAll('#restree .drop').forEach(function(b){b.classList.remove('drop');});});
+    bar.addEventListener('dragover',function(e){e.preventDefault();if(bar.getAttribute('data-id')!==__dragId)bar.classList.add('drop');});
+    bar.addEventListener('dragleave',function(){bar.classList.remove('drop');});
+    bar.addEventListener('drop',function(e){e.preventDefault();bar.classList.remove('drop');resMove(__dragId,bar.getAttribute('data-id'));});
+  });
+  var top=document.querySelector('#restree [data-droptop]');
+  if(top){top.addEventListener('dragover',function(e){e.preventDefault();top.style.background='var(--greenbg)';});
+    top.addEventListener('dragleave',function(){top.style.background='';});
+    top.addEventListener('drop',function(e){e.preventDefault();top.style.background='';resMove(__dragId,'admin');});}
+}
+function resMove(id,target){ if(!id||id===target)return;
+  if(target!=='admin'&&isDescId(id,target)){toast('Can’t move an account under its own sub-account');return;}
+  api('reparent',{id:id,parent:target}).then(function(d){if(d.ok)load();else toast(d.error||'move failed');});
 }
 function renderModes(){
   if(ROLE!=='admin')return;var c=S.config;if(!c||!c.paid)return;var apps=['windows','android','ios'],h='';
