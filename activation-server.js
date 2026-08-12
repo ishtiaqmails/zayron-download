@@ -39,10 +39,49 @@ if (!db) {
     },
     resellers: {},   // id -> { name, key, credits, parent, enabled, created }
     devices: {},     // MAC -> { app, plan, expires, activated_by, created, status, note }
+    seen: {},        // MAC -> { app, ver, first, last, count }  (live usage tracking)
     ledger: []       // { ts, type, reseller, amount, mac, note }
   };
   save(db);
   console.log('First run. ADMIN KEY = ' + db.admin_key + '  (change it in the panel; keep it secret)');
+}
+if (!db.seen) db.seen = {};   // migrate older data files
+
+// ---------- usage tracking (debounced saves so heavy traffic never thrashes the disk) ----------
+let __dirty = false;
+function markDirty() { __dirty = true; }
+setInterval(function () { if (__dirty) { __dirty = false; try { save(db); } catch (e) {} } }, 15000).unref();
+function recordSeen(mac, app, ver) {
+  if (!mac) return;
+  if (mac.replace(/[^0-9A-F]/g, '').length < 6) return;   // ignore junk / web fallbacks
+  const s = db.seen[mac] || { first: now(), count: 0 };
+  s.app = app || s.app || 'unknown';
+  if (ver) s.ver = String(ver).slice(0, 20);
+  s.last = now();
+  s.count = (s.count || 0) + 1;
+  db.seen[mac] = s;
+  markDirty();
+}
+function computeStats() {
+  const t = now(), MIN = 60 * 1000, H = 3600 * 1000, D = 24 * H;
+  const S = { total: 0, online: 0, today: 0, week: 0, month: 0,
+    byApp: { windows: 0, android: 0, ios: 0, other: 0 }, recent: [] };
+  const macs = Object.keys(db.seen || {});
+  S.total = macs.length;
+  const arr = [];
+  for (const m of macs) {
+    const s = db.seen[m], age = t - (s.last || 0);
+    if (age <= 7 * MIN) S.online++;
+    if (age <= D) S.today++;
+    if (age <= 7 * D) S.week++;
+    if (age <= 30 * D) S.month++;
+    const a = (s.app === 'windows' || s.app === 'android' || s.app === 'ios') ? s.app : 'other';
+    S.byApp[a]++;
+    arr.push({ mac: m, app: s.app, ver: s.ver || '', last: s.last, count: s.count || 0 });
+  }
+  arr.sort((a, b) => (b.last || 0) - (a.last || 0));
+  S.recent = arr.slice(0, 20);
+  return S;
 }
 
 // ---------- helpers ----------
@@ -109,6 +148,7 @@ const server = http.createServer(async (req, res) => {
     const app = (body.app || 'windows').toLowerCase();
     const mac = normMac(body.mac);
     const c = db.config;
+    recordSeen(mac, app, body.ver);   // live usage: remember this device checked in
     if (c.kill[app]) return json(res, 200, { active: false, kill: true, message: 'This app is temporarily unavailable. ' + c.contact });
     if (!c.paid[app]) return json(res, 200, { active: true, free: true });        // FREE mode → always allow
     let dev = db.devices[mac];
@@ -137,7 +177,7 @@ const server = http.createServer(async (req, res) => {
     let b = {}; try { b = JSON.parse(await readBody(req) || '{}'); } catch (e) {}
     const a = b.action;
     try {
-      if (a === 'state') return json(res, 200, { config: db.config, resellers: db.resellers, devices: db.devices, ledger: db.ledger.slice(-100).reverse() });
+      if (a === 'state') return json(res, 200, { config: db.config, resellers: db.resellers, devices: db.devices, ledger: db.ledger.slice(-100).reverse(), stats: computeStats() });
       if (a === 'setConfig') { db.config = Object.assign(db.config, b.config || {}); save(db); return json(res, 200, { ok: true }); }
       if (a === 'setAdminKey') { if (b.key && b.key.length >= 6) { db.admin_key = b.key; save(db); return json(res, 200, { ok: true }); } return json(res, 200, { ok: false, error: 'key too short' }); }
       if (a === 'activate') return json(res, 200, activate(b.mac, b.app, b.plan, b.by || 'admin', b.note));
@@ -310,6 +350,27 @@ tbody tr:hover{background:#f7fafd}
 
       <!-- DASHBOARD -->
       <section id="v-dash" class="view">
+        <div class="row" style="justify-content:space-between;align-items:baseline;margin:0 0 12px">
+          <h3 style="margin:0;font-size:16px">Live usage <span id="liveDot" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);margin-left:5px;vertical-align:middle;box-shadow:0 0 0 4px rgba(18,161,80,.15)"></span></h3>
+          <span class="sub" style="margin:0" id="liveUpd">auto-updates every 30s</span>
+        </div>
+        <div class="stats">
+          <div class="stat"><div class="lbl"><span class="ci gr"><svg viewBox="0 0 24 24" style="width:18px;height:18px"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="3.5" fill="currentColor" stroke="none"/></svg></span>Online now</div><div class="num" id="u_online">0</div></div>
+          <div class="stat"><div class="lbl"><span class="ci cy"><svg viewBox="0 0 24 24" style="width:18px;height:18px"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg></span>Active today</div><div class="num" id="u_today">0</div></div>
+          <div class="stat"><div class="lbl"><span class="ci cy"><svg viewBox="0 0 24 24" style="width:18px;height:18px"><rect x="3" y="4" width="18" height="17" rx="2"/><path d="M3 9h18M8 2v4M16 2v4"/></svg></span>This week</div><div class="num" id="u_week">0</div></div>
+          <div class="stat"><div class="lbl"><span class="ci am"><svg viewBox="0 0 24 24" style="width:18px;height:18px"><circle cx="9" cy="8" r="3"/><path d="M3.5 19c0-3 2.5-4.5 5.5-4.5s5.5 1.5 5.5 4.5"/><circle cx="17" cy="9" r="2.2"/></svg></span>Total users</div><div class="num" id="u_total">0</div></div>
+        </div>
+        <div class="card">
+          <h3>By app</h3>
+          <div class="sub">Which app your users are running (every device ever seen).</div>
+          <div id="byapp"></div>
+        </div>
+        <div class="card">
+          <div class="row" style="justify-content:space-between"><h3 style="margin:0">Recently active</h3><span class="sub" style="margin:0">Last 20 check-ins</span></div>
+          <table id="recent"></table>
+        </div>
+        <h3 style="margin:24px 0 2px;font-size:16px">Licensing</h3>
+        <div class="sub" style="margin:0 0 12px">Paid activations, expiry and resellers.</div>
         <div class="stats">
           <div class="stat"><div class="lbl"><span class="ci cy"><svg viewBox="0 0 24 24" style="width:18px;height:18px"><rect x="2" y="6" width="20" height="12" rx="2"/><path d="M8 21h8"/></svg></span>Total devices</div><div class="num" id="s_total">0</div></div>
           <div class="stat"><div class="lbl"><span class="ci gr"><svg viewBox="0 0 24 24" style="width:18px;height:18px"><path d="M20 6L9 17l-5-5"/></svg></span>Active</div><div class="num" id="s_active">0</div></div>
@@ -420,9 +481,11 @@ function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,function(c){return
 function login(){
   fetch('admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:$('key').value})})
   .then(function(r){return r.json();})
-  .then(function(d){if(d.ok){$('login').style.display='none';$('shell').style.display='flex';load();}else $('lerr').textContent='Wrong key — try again';});
+  .then(function(d){if(d.ok){$('login').style.display='none';$('shell').style.display='flex';load();startAuto();}else $('lerr').textContent='Wrong key — try again';});
 }
-function load(){post('state').then(function(d){if(d.error){$('login').style.display='';$('shell').style.display='none';return;}S=d;render();});}
+var __auto=null;
+function startAuto(){if(__auto)return;__auto=setInterval(function(){load();},30000);}
+function load(){post('state').then(function(d){if(d.error){if(__auto){clearInterval(__auto);__auto=null;}$('login').style.display='';$('shell').style.display='none';return;}S=d;render();});}
 function go(view){
   var items=document.querySelectorAll('.navi');for(var i=0;i<items.length;i++)items[i].classList.toggle('on',items[i].getAttribute('data-view')===view);
   var secs=document.querySelectorAll('.view');for(var j=0;j<secs.length;j++)secs[j].hidden=(secs[j].id!=='v-'+view);
@@ -443,8 +506,29 @@ function classify(d){
 }
 function fmt(ts){if(ts==null)return 'Lifetime';var x=new Date(ts);return x.getFullYear()+'-'+String(x.getMonth()+1).padStart(2,'0')+'-'+String(x.getDate()).padStart(2,'0');}
 function daysLeft(ts){if(ts==null)return '∞';var d=Math.ceil((ts-Date.now())/86400000);return d+' d';}
+function timeAgo(ts){if(!ts)return '—';var s=Math.floor((Date.now()-ts)/1000);if(s<60)return 'just now';var m=Math.floor(s/60);if(m<60)return m+'m ago';var h=Math.floor(m/60);if(h<24)return h+'h ago';var d=Math.floor(h/24);return d+'d ago';}
+var APPMETA={windows:{label:'Windows',color:'#1fa6e8'},android:{label:'Android',color:'#12a150'},ios:{label:'iOS',color:'#7a5cff'},other:{label:'Other',color:'#94a3b8'}};
+function renderUsage(){
+  var u=S.stats||{online:0,today:0,week:0,total:0,byApp:{},recent:[]};
+  $('u_online').textContent=u.online||0;$('u_today').textContent=u.today||0;$('u_week').textContent=u.week||0;$('u_total').textContent=u.total||0;
+  var dot=$('liveDot');if(dot)dot.style.background=(u.online>0)?'var(--green)':'#c2ccd8';
+  // by-app bars
+  var ba=u.byApp||{};var keys=['windows','android','ios','other'];var max=1;keys.forEach(function(k){max=Math.max(max,ba[k]||0);});
+  var h='';keys.forEach(function(k){var v=ba[k]||0;var meta=APPMETA[k];var pct=Math.round((v/max)*100);
+    h+='<div style="display:flex;align-items:center;gap:12px;margin:11px 0"><div style="width:78px;font-size:13px;font-weight:700;color:'+meta.color+'">'+meta.label+'</div>'+
+      '<div style="flex:1;background:#eef3f9;border-radius:8px;height:14px;overflow:hidden"><div style="height:100%;width:'+pct+'%;background:'+meta.color+';border-radius:8px;transition:width .4s"></div></div>'+
+      '<div style="width:44px;text-align:right;font-weight:800;font-size:14px">'+v+'</div></div>';});
+  $('byapp').innerHTML=h;
+  // recently active table
+  var rec=u.recent||[];var rh='<tr><th>MAC</th><th>App</th><th>Version</th><th>Check-ins</th><th>Last seen</th></tr>';
+  if(!rec.length)rh+='<tr><td colspan="5" class="empty">No devices have checked in yet. Install a 3.6.4 build and open it — it will appear here within seconds.</td></tr>';
+  rec.forEach(function(x){var meta=APPMETA[(x.app==='windows'||x.app==='android'||x.app==='ios')?x.app:'other'];
+    rh+='<tr><td class="mono">'+esc(x.mac)+'</td><td><span style="color:'+meta.color+';font-weight:700">'+meta.label+'</span></td><td>'+esc(x.ver||'—')+'</td><td>'+(x.count||0)+'</td><td>'+timeAgo(x.last)+'</td></tr>';});
+  $('recent').innerHTML=rh;
+}
 
 function render(){
+  renderUsage();
   var c=S.config,devs=S.devices||{},res=S.resellers||{};
   var macs=Object.keys(devs);
   // stats
