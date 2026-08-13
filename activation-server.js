@@ -69,7 +69,7 @@ if (!db.config.update) db.config.update = { windows: { on: false, min: 0, latest
 if (!db.config.apps) db.config.apps = [{ id: 'windows', label: 'Windows' }, { id: 'android', label: 'Android' }];
 if (!db.maxver) db.maxver = {};   // highest version code seen per app (for 1-tap "force to latest")
 if (!db.admin.api_key) db.admin.api_key = crypto.randomBytes(16).toString('hex');
-Object.keys(db.accounts).forEach(function (id) { if (!db.accounts[id].api_key) db.accounts[id].api_key = crypto.randomBytes(16).toString('hex'); if (db.accounts[id].api_enabled === undefined) db.accounts[id].api_enabled = false; });
+Object.keys(db.accounts).forEach(function (id) { if (!db.accounts[id].api_key) db.accounts[id].api_key = crypto.randomBytes(16).toString('hex'); if (db.accounts[id].api_enabled === undefined) db.accounts[id].api_enabled = false; if (!db.accounts[id].type) db.accounts[id].type = 'reseller'; });
 if (db.resellers && Object.keys(db.resellers).length && !Object.keys(db.accounts).length) {
   Object.keys(db.resellers).forEach(function (id) {
     const r = db.resellers[id];
@@ -130,12 +130,12 @@ function planExpiry(plan, fromTs) { if (plan === 'lifetime') return null; const 
 function deviceActive(dev) { if (!dev || dev.status === 'blocked') return false; if (dev.plan === 'lifetime' || dev.expires == null) return true; return dev.expires > now(); }
 function creditsFor(plan) { return plan === 'lifetime' ? 2 : 1; }
 
-function activate(uid, mac, app, plan, note, isRenew) {
+function activate(uid, mac, app, plan, note, isRenew, mint) {
   mac = macKey(mac); if (!mac) return { ok: false, error: 'bad mac' };
   const cur = db.devices[mac];
-  if (isRenew && uid !== 'admin' && cur && !isDesc(uid, cur.activated_by)) return { ok: false, error: 'not your device' };
+  if (isRenew && !mint && cur && !isDesc(uid, cur.activated_by)) return { ok: false, error: 'not your device' };
   const cost = creditsFor(plan);
-  if (uid !== 'admin') { if (balanceOf(uid) < cost) return { ok: false, error: 'not enough credits' }; db.accounts[uid].credits -= cost; }
+  if (!mint) { if (balanceOf(uid) < cost) return { ok: false, error: 'not enough credits' }; db.accounts[uid].credits -= cost; }
   const fromTs = cur && cur.plan !== 'lifetime' && cur.expires ? cur.expires : now();
   db.devices[mac] = {
     app: app || (cur && cur.app) || 'any',
@@ -146,7 +146,7 @@ function activate(uid, mac, app, plan, note, isRenew) {
     status: 'active',
     note: (note != null && note !== '') ? note : (cur && cur.note) || ''
   };
-  db.ledger.push({ ts: now(), type: isRenew ? 'renew' : 'activate', from: uid, mac: mac, amount: (uid === 'admin' ? 0 : -cost), note: plan });
+  db.ledger.push({ ts: now(), type: isRenew ? 'renew' : 'activate', from: uid, mac: mac, amount: (mint ? 0 : -cost), note: plan });
   save(db); return { ok: true };
 }
 
@@ -173,20 +173,46 @@ function computeStats() {
   arr.sort((a, b) => (b.last || 0) - (a.last || 0)); S.recent = arr.slice(0, 20); return S;
 }
 
+// ---------- roles & permissions ----------
+// Owner (admin login) = full. super_admin / mini_admin = staff (see everything, no global switches).
+// reseller / sub_reseller = scoped to their own tree.
+const RANK = { admin: 4, super_admin: 3, mini_admin: 2, reseller: 1, sub_reseller: 1 };
+function rankOf(role) { return RANK[role] || 1; }
+function permsOf(role) {
+  if (role === 'admin')       return { staff: true, scope: 'all', global: true,  assign: ['super_admin', 'mini_admin', 'reseller', 'sub_reseller'] };
+  if (role === 'super_admin') return { staff: true, scope: 'all', global: false, assign: ['mini_admin', 'reseller', 'sub_reseller'] };
+  if (role === 'mini_admin')  return { staff: true, scope: 'all', global: false, assign: ['reseller', 'sub_reseller'] };
+  return { staff: false, scope: 'own', global: false, assign: ['sub_reseller', 'reseller'] };   // reseller makes sub-resellers
+}
+function accType(id) { return (db.accounts[id] && db.accounts[id].type) || 'reseller'; }
+function canTouchDevice(cu, mac) { return permsOf(cu.role).scope === 'all' ? true : ownsDevice(cu.uid, mac); }
+// Can cu manage (edit/reset/move/delete/role) the target account?
+function canManageAccount(cu, id) {
+  if (!db.accounts[id]) return false;
+  const p = permsOf(cu.role);
+  if (p.scope === 'all') return rankOf(cu.role) > rankOf(accType(id));   // staff manage strictly-lower ranks only
+  return isDesc(cu.uid, id);                                            // reseller manages own subtree
+}
+function isMint(cu) { return permsOf(cu.role).staff; }   // owner + staff issue credits like a mint
+
 // ---------- build role-scoped state for the panel ----------
-function accountView(id) { const a = db.accounts[id]; return { id: id, username: a.username, name: a.name, email: a.email || '', credits: a.credits || 0, parent: a.parent || null, enabled: a.enabled !== false, api_enabled: a.api_enabled === true, created: a.created, hasPass: !!a.hash, children: directChildren(id).length }; }
+function accountView(id) { const a = db.accounts[id]; return { id: id, username: a.username, name: a.name, email: a.email || '', credits: a.credits || 0, parent: a.parent || null, enabled: a.enabled !== false, api_enabled: a.api_enabled === true, type: a.type || 'reseller', created: a.created, hasPass: !!a.hash, children: directChildren(id).length }; }
 function stateFor(cu) {
-  if (cu.role === 'admin') {
+  const p = permsOf(cu.role);
+  if (p.scope === 'all') {   // owner + super_admin + mini_admin see everything
     const accs = {}; Object.keys(db.accounts).forEach(function (id) { accs[id] = accountView(id); });
-    return { role: 'admin', me: { username: db.admin.username, credits: null },
+    const meName = cu.uid === 'admin' ? db.admin.username : ((db.accounts[cu.uid] || {}).username || 'staff');
+    return { role: cu.role, perms: { global: p.global, assign: p.assign, staff: true, rank: rankOf(cu.role) },
+      me: { id: cu.uid, username: meName, credits: null },
       config: db.config, accounts: accs, devices: db.devices, stats: computeStats(), maxver: db.maxver,
-      allseen: db.seen, ledger: db.ledger.slice(-120).reverse().map(fmtLedger) };
+      allseen: db.seen, ledger: db.ledger.slice(-160).reverse().map(fmtLedger) };
   }
   const uid = cu.uid, ids = subtreeIds(uid); const accs = {}; ids.forEach(function (id) { accs[id] = accountView(id); });
   const devs = {}; Object.keys(db.devices).forEach(function (m) { if (ownsDevice(uid, m) && db.devices[m].activated_by !== 'admin' && isDesc(uid, db.devices[m].activated_by)) devs[m] = db.devices[m]; });
   const me = db.accounts[uid] || {};
   const led = db.ledger.filter(function (e) { return e.from === uid || e.to === uid || (e.mac && devs[e.mac]); }).slice(-120).reverse().map(fmtLedger);
-  return { role: 'reseller', me: { id: uid, username: me.username, name: me.name, email: me.email || '', credits: me.credits || 0, api_enabled: me.api_enabled === true },
+  return { role: cu.role, perms: { global: false, assign: p.assign, staff: false, rank: 1 },
+    me: { id: uid, username: me.username, name: me.name, email: me.email || '', credits: me.credits || 0, api_enabled: me.api_enabled === true },
     config: { contact: db.config.contact, downloads: db.config.downloads }, accounts: accs, devices: devs, ledger: led };
 }
 function fmtLedger(e) { return { ts: e.ts, type: e.type, from: displayName(e.from), to: e.to ? displayName(e.to) : '', amount: e.amount, mac: e.mac || '', note: e.note || '' }; }
@@ -241,7 +267,7 @@ const server = http.createServer(async (req, res) => {
       const t = newSession('admin', 'admin'); res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': 'zadm=' + t + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000' }); return res.end(JSON.stringify({ ok: true, role: 'admin', token: t }));
     }
     const id = Object.keys(db.accounts).find(function (i) { return (db.accounts[i].username || '').toLowerCase() === un.toLowerCase(); });
-    if (id) { const a = db.accounts[id]; if (a.enabled === false) return json(res, 200, { ok: false, error: 'account disabled' }); if (chkPass(pw, a)) { const t = newSession(id, 'reseller'); res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': 'zadm=' + t + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000' }); return res.end(JSON.stringify({ ok: true, role: 'reseller', token: t })); } }
+    if (id) { const a = db.accounts[id]; if (a.enabled === false) return json(res, 200, { ok: false, error: 'account disabled' }); if (chkPass(pw, a)) { const role = a.type || 'reseller'; const t = newSession(id, role); res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': 'zadm=' + t + '; Path=/; HttpOnly; SameSite=Lax; Max-Age=2592000' }); return res.end(JSON.stringify({ ok: true, role: role, token: t })); } }
     return json(res, 200, { ok: false, error: 'wrong username or password' });
   }
   if (p.endsWith('/admin/logout') && req.method === 'POST') { dropSession(tokenOf(req)); res.writeHead(200, { 'Content-Type': 'application/json', 'Set-Cookie': 'zadm=; Path=/; HttpOnly; Max-Age=0' }); return res.end('{"ok":true}'); }
@@ -265,40 +291,49 @@ const server = http.createServer(async (req, res) => {
         if (role === 'admin') { if (!chkPass(b.oldpass || '', db.admin)) return json(res, 200, { ok: false, error: 'current password is wrong' }); const np = mkPass(b.newpass); db.admin.salt = np.salt; db.admin.hash = np.hash; if (b.username) db.admin.username = String(b.username).trim(); save(db); return json(res, 200, { ok: true }); }
         const me = db.accounts[uid]; if (!chkPass(b.oldpass || '', me)) return json(res, 200, { ok: false, error: 'current password is wrong' }); const np = mkPass(b.newpass); me.salt = np.salt; me.hash = np.hash; save(db); return json(res, 200, { ok: true }); }
 
-      // create a reseller / sub-reseller under me
+      // create a reseller / sub-reseller / staff account
       if (a === 'createAccount') {
+        const P = permsOf(role);
         const un = String(b.username || '').trim(); if (un.length < 3) return json(res, 200, { ok: false, error: 'username too short (min 3)' });
         if (!/^[a-zA-Z0-9_.-]+$/.test(un)) return json(res, 200, { ok: false, error: 'username: letters, numbers, . _ - only' });
         if (usernameTaken(un)) return json(res, 200, { ok: false, error: 'username already taken' });
         if (!b.password || b.password.length < 4) return json(res, 200, { ok: false, error: 'password too short (min 4)' });
+        let type = 'reseller'; if (b.type && P.assign.indexOf(b.type) >= 0) type = b.type;
+        const staffType = (type === 'super_admin' || type === 'mini_admin');
         const startCr = parseInt(b.credits) || 0;
-        if (startCr > 0 && role !== 'admin' && balanceOf(uid) < startCr) return json(res, 200, { ok: false, error: 'not enough credits for that starting balance' });
+        if (startCr > 0 && !isMint(cu) && balanceOf(uid) < startCr) return json(res, 200, { ok: false, error: 'not enough credits for that starting balance' });
         const id = crypto.randomBytes(4).toString('hex'); const pw = mkPass(b.password);
-        db.accounts[id] = { id: id, username: un, salt: pw.salt, hash: pw.hash, name: (b.name || un).trim(), email: (b.email || '').trim(), credits: 0, parent: (role === 'admin' ? null : uid), enabled: true, api_enabled: false, created: now(), api_key: crypto.randomBytes(16).toString('hex') };
+        // staff / owner create top-level (or under a chosen parent); a reseller creates under itself
+        const parent = P.staff ? (b.parent && db.accounts[b.parent] ? b.parent : null) : uid;
+        db.accounts[id] = { id: id, username: un, salt: pw.salt, hash: pw.hash, name: (b.name || un).trim(), email: (b.email || '').trim(), credits: 0, parent: (staffType ? null : parent), enabled: true, api_enabled: false, type: type, created: now(), api_key: crypto.randomBytes(16).toString('hex') };
         save(db);
-        if (startCr > 0) transfer(uid, id, startCr);
+        if (startCr > 0 && !staffType) { if (isMint(cu)) { db.accounts[id].credits = startCr; db.ledger.push({ ts: now(), type: 'credit', from: uid, to: id, amount: startCr }); save(db); } else transfer(uid, id, startCr); }
         return json(res, 200, { ok: true, id: id });
       }
-      // transfer credits to a direct child
-      if (a === 'transfer') { const to = db.accounts[b.id]; if (!to) return json(res, 200, { ok: false, error: 'unknown account' }); const okChild = (role === 'admin') ? (to.parent == null) : (to.parent === uid); if (!okChild) return json(res, 403, { error: 'not your direct account' }); return json(res, 200, transfer(uid, b.id, b.amount)); }
-      // reset a descendant's password
-      if (a === 'resetPass') { const t = db.accounts[b.id]; if (!t) return json(res, 200, { ok: false, error: 'unknown account' }); if (role !== 'admin' && !isDesc(uid, b.id)) return json(res, 403, { error: 'not in your tree' }); if (!b.password || b.password.length < 4) return json(res, 200, { ok: false, error: 'password too short (min 4)' }); const np = mkPass(b.password); t.salt = np.salt; t.hash = np.hash; save(db); return json(res, 200, { ok: true }); }
-      // enable / disable a descendant
-      if (a === 'toggleAccount') { const t = db.accounts[b.id]; if (!t) return json(res, 200, { ok: false, error: 'unknown' }); if (role !== 'admin' && !isDesc(uid, b.id)) return json(res, 403, { error: 'not in your tree' }); t.enabled = !(t.enabled !== false); save(db); return json(res, 200, { ok: true, enabled: t.enabled }); }
-      // re-assign a sub-reseller to a new parent (admin only)
-      if (a === 'reparent') { if (!adminOnly()) return json(res, 403, { error: 'admins only' }); const t = db.accounts[b.id]; if (!t) return json(res, 200, { ok: false, error: 'unknown' }); const np = (b.parent === 'admin' || !b.parent) ? null : b.parent; if (np && !db.accounts[np]) return json(res, 200, { ok: false, error: 'unknown new parent' }); if (np === b.id) return json(res, 200, { ok: false, error: 'cannot parent to itself' }); if (np && isDesc(b.id, np)) return json(res, 200, { ok: false, error: 'cannot move under its own sub-account' }); t.parent = np; save(db); return json(res, 200, { ok: true }); }
-      // delete an account (admin only; must have no children)
-      if (a === 'deleteAccount') { if (!adminOnly()) return json(res, 403, { error: 'admins only' }); if (directChildren(b.id).length) return json(res, 200, { ok: false, error: 'move or remove its sub-accounts first' }); delete db.accounts[b.id]; save(db); return json(res, 200, { ok: true }); }
+      // give / take credits
+      if (a === 'transfer') { const to = db.accounts[b.id]; if (!to) return json(res, 200, { ok: false, error: 'unknown account' });
+        if (isMint(cu)) { if (!canManageAccount(cu, b.id)) return json(res, 403, { error: 'not allowed' }); const amt = parseInt(b.amount) || 0; if (amt < 0 && (to.credits || 0) < -amt) return json(res, 200, { ok: false, error: 'account does not have that many credits' }); to.credits = (to.credits || 0) + amt; db.ledger.push({ ts: now(), type: 'credit', from: uid, to: b.id, amount: amt }); save(db); return json(res, 200, { ok: true }); }
+        if (to.parent !== uid) return json(res, 403, { error: 'not your direct account' }); return json(res, 200, transfer(uid, b.id, b.amount)); }
+      // reset password
+      if (a === 'resetPass') { const t = db.accounts[b.id]; if (!t) return json(res, 200, { ok: false, error: 'unknown account' }); if (!canManageAccount(cu, b.id)) return json(res, 403, { error: 'not allowed' }); if (!b.password || b.password.length < 4) return json(res, 200, { ok: false, error: 'password too short (min 4)' }); const np = mkPass(b.password); t.salt = np.salt; t.hash = np.hash; save(db); return json(res, 200, { ok: true }); }
+      // enable / disable
+      if (a === 'toggleAccount') { const t = db.accounts[b.id]; if (!t) return json(res, 200, { ok: false, error: 'unknown' }); if (!canManageAccount(cu, b.id)) return json(res, 403, { error: 'not allowed' }); t.enabled = !(t.enabled !== false); save(db); return json(res, 200, { ok: true, enabled: t.enabled }); }
+      // assign a role type (owner / super-admin, within what they may assign)
+      if (a === 'setRole') { const P = permsOf(role); const t = db.accounts[b.id]; if (!t) return json(res, 200, { ok: false, error: 'unknown' }); if (!canManageAccount(cu, b.id)) return json(res, 403, { error: 'not allowed' }); if (P.assign.indexOf(b.type) < 0) return json(res, 200, { ok: false, error: 'you cannot assign that role' }); t.type = b.type; if (b.type === 'super_admin' || b.type === 'mini_admin') t.parent = null; save(db); return json(res, 200, { ok: true }); }
+      // re-assign to a new parent
+      if (a === 'reparent') { const t = db.accounts[b.id]; if (!t) return json(res, 200, { ok: false, error: 'unknown' }); if (!canManageAccount(cu, b.id)) return json(res, 403, { error: 'not allowed' }); const np = (b.parent === 'admin' || !b.parent) ? null : b.parent; if (np && !db.accounts[np]) return json(res, 200, { ok: false, error: 'unknown new parent' }); if (np === b.id) return json(res, 200, { ok: false, error: 'cannot parent to itself' }); if (np && isDesc(b.id, np)) return json(res, 200, { ok: false, error: 'cannot move under its own sub-account' }); t.parent = np; save(db); return json(res, 200, { ok: true }); }
+      // delete an account (must have no children)
+      if (a === 'deleteAccount') { const t = db.accounts[b.id]; if (!t) return json(res, 200, { ok: false, error: 'unknown' }); if (!canManageAccount(cu, b.id)) return json(res, 403, { error: 'not allowed' }); if (directChildren(b.id).length) return json(res, 200, { ok: false, error: 'move or remove its sub-accounts first' }); delete db.accounts[b.id]; save(db); return json(res, 200, { ok: true }); }
 
-      // activate / renew a device
-      if (a === 'activate') return json(res, 200, activate(uid, b.mac, b.app, b.plan, b.note, false));
-      if (a === 'renew') return json(res, 200, activate(uid, b.mac, b.app, b.plan, b.note, true));
-      // block / unblock / delete a device (must own it)
-      if (a === 'block' || a === 'unblock' || a === 'delete') { const mac = macKey(b.mac); if (!ownsDevice(uid, mac)) return json(res, 403, { error: 'not your device' });
+      // activate / renew a device (staff + owner activate free; resellers spend credits)
+      if (a === 'activate') return json(res, 200, activate(uid, b.mac, b.app, b.plan, b.note, false, isMint(cu)));
+      if (a === 'renew') return json(res, 200, activate(uid, b.mac, b.app, b.plan, b.note, true, isMint(cu)));
+      // block / unblock / delete a device
+      if (a === 'block' || a === 'unblock' || a === 'delete') { const mac = macKey(b.mac); if (!canTouchDevice(cu, mac)) return json(res, 403, { error: 'not your device' });
         if (a === 'delete') { delete db.devices[mac]; save(db); return json(res, 200, { ok: true }); }
         const d = db.devices[mac]; if (d) { d.status = (a === 'block') ? 'blocked' : 'active'; save(db); } return json(res, 200, { ok: !!d }); }
       // edit a device fully (plan / expiry / status / note) — for fixing mistakes
-      if (a === 'editDevice') { const mac = macKey(b.mac); if (!ownsDevice(uid, mac)) return json(res, 403, { error: 'not your device' }); const d = db.devices[mac]; if (!d) return json(res, 200, { ok: false, error: 'device not found' });
+      if (a === 'editDevice') { const mac = macKey(b.mac); if (!canTouchDevice(cu, mac)) return json(res, 403, { error: 'not your device' }); const d = db.devices[mac]; if (!d) return json(res, 200, { ok: false, error: 'device not found' });
         if (b.plan) d.plan = b.plan;
         if (b.status === 'active' || b.status === 'blocked') d.status = b.status;
         if (b.note != null) d.note = String(b.note);
@@ -311,7 +346,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 200, { ok: true, mac: mac, installed: !!s, seen: s ? { app: s.app, ver: s.ver || '', last: s.last, first: s.first, count: s.count || 0 } : null, device: dv }); }
 
       // edit a reseller/sub-reseller's details (admin, or a parent editing its own tree)
-      if (a === 'editAccount') { const t = db.accounts[b.id]; if (!t) return json(res, 200, { ok: false, error: 'unknown account' }); if (role !== 'admin' && !isDesc(uid, b.id)) return json(res, 403, { error: 'not in your tree' });
+      if (a === 'editAccount') { const t = db.accounts[b.id]; if (!t) return json(res, 200, { ok: false, error: 'unknown account' }); if (!canManageAccount(cu, b.id)) return json(res, 403, { error: 'not allowed' });
         if (b.username != null) { const un = String(b.username).trim(); if (un.length < 3) return json(res, 200, { ok: false, error: 'username too short' }); if (!/^[a-zA-Z0-9_.-]+$/.test(un)) return json(res, 200, { ok: false, error: 'username: letters, numbers, . _ - only' }); if (un.toLowerCase() !== (t.username || '').toLowerCase() && usernameTaken(un)) return json(res, 200, { ok: false, error: 'username already taken' }); t.username = un; }
         if (b.name != null) t.name = String(b.name).trim() || t.name;
         if (b.email != null) t.email = String(b.email).trim();
@@ -326,7 +361,7 @@ const server = http.createServer(async (req, res) => {
       // force-update config (admin only)
       if (a === 'setUpdate') { if (!adminOnly()) return json(res, 403, { error: 'admins only' }); const ap = b.app; if (!db.config.update[ap]) db.config.update[ap] = {}; db.config.update[ap] = { on: !!b.on, min: parseInt(b.min) || 0, latest: (b.latest || '').trim(), url: (b.url || '').trim(), msg: (b.msg || '').trim() }; save(db); return json(res, 200, { ok: true }); }
       // reseller automation API key (self, or admin regen for a child)
-      if (a === 'apiKey') { if (b.id && b.id !== uid) { if (role !== 'admin' && !isDesc(uid, b.id)) return json(res, 403, { error: 'not in your tree' }); if (b.regen) db.accounts[b.id].api_key = crypto.randomBytes(16).toString('hex'); save(db); return json(res, 200, { ok: true, key: db.accounts[b.id].api_key }); }
+      if (a === 'apiKey') { if (b.id && b.id !== uid) { if (!canManageAccount(cu, b.id)) return json(res, 403, { error: 'not in your tree' }); if (b.regen) db.accounts[b.id].api_key = crypto.randomBytes(16).toString('hex'); save(db); return json(res, 200, { ok: true, key: db.accounts[b.id].api_key }); }
         if (uid === 'admin') { if (b.regen) db.admin.api_key = crypto.randomBytes(16).toString('hex'); save(db); return json(res, 200, { ok: true, key: db.admin.api_key }); }
         const me = db.accounts[uid]; if (me.api_enabled !== true) return json(res, 200, { ok: false, disabled: true, error: 'API access is turned off by your administrator' }); if (b.regen) me.api_key = crypto.randomBytes(16).toString('hex'); save(db); return json(res, 200, { ok: true, key: me.api_key }); }
       // admin turns a reseller's API access on/off
@@ -410,6 +445,14 @@ th{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.
 .tag{font-size:11px;font-weight:700;padding:3px 10px;border-radius:20px;display:inline-block}
 .tag.on{background:var(--greenbg);color:var(--green)}.tag.off{background:var(--redbg);color:var(--red)}.tag.soon{background:var(--amberbg);color:var(--amber)}.tag.life{background:rgba(31,166,232,.14);color:var(--cyd)}
 .empty{text-align:center;color:var(--muted);padding:26px;font-size:13.5px}.ok{color:var(--green);font-weight:700}.note{font-size:12.5px;color:var(--muted);margin-top:6px}
+.pager{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-top:12px;flex-wrap:wrap}
+.pager .pinfo{font-size:12.5px;color:var(--muted)}
+.pager .pbtns{display:flex;gap:6px;align-items:center}
+.pager .pbtns button{padding:6px 12px;font-size:13px;border-radius:8px;background:#eef3f9;border:1px solid var(--line);color:#455872;font-weight:700}
+.pager .pbtns button:disabled{opacity:.4;cursor:default}
+.pager .pbtns .cur{background:var(--navy);color:#fff;border-color:var(--navy)}
+.rbadge{font-size:9px;font-weight:800;padding:2px 7px;border-radius:20px;color:#fff;letter-spacing:.4px;text-transform:uppercase}
+.rbadge.owner{background:#0e2a4f}.rbadge.super_admin{background:#7a5cff}.rbadge.mini_admin{background:#c9860a}.rbadge.reseller{background:var(--cyd)}.rbadge.sub_reseller{background:#94a3b8}
 .lookup{background:#f9fbfe;border:1px dashed var(--line);border-radius:14px;padding:18px;margin-top:14px}
 .lookup .k{color:var(--muted);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:.5px}.big{font-size:22px;font-weight:800}
 .dl{display:grid;grid-template-columns:repeat(2,1fr);gap:16px}
@@ -451,6 +494,7 @@ th{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.
     <nav id="nav">
       <div class="navi on" data-view="dash"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9" rx="1.5"/><rect x="14" y="3" width="7" height="5" rx="1.5"/><rect x="14" y="12" width="7" height="9" rx="1.5"/><rect x="3" y="16" width="7" height="5" rx="1.5"/></svg><span>Dashboard</span></div>
       <div class="navi" data-view="cust"><svg viewBox="0 0 24 24"><circle cx="9" cy="8" r="3.2"/><path d="M3.5 20c0-3.3 2.7-5 5.5-5s5.5 1.7 5.5 5"/><path d="M17 9.5a2.7 2.7 0 1 0-1-5.2M20.5 20c0-2.6-1.6-4.2-3.5-4.7"/></svg><span>Customers</span></div>
+      <div class="navi" data-view="users"><svg viewBox="0 0 24 24"><rect x="2" y="6" width="20" height="12" rx="2"/><circle cx="8" cy="12" r="2"/><path d="M13 10h5M13 14h5"/></svg><span>Users</span></div>
       <div class="navi" data-view="activate"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 8v8M8 12h8"/></svg><span>Activate</span></div>
       <div class="navi" data-view="check"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.2-3.2"/></svg><span>Check MAC</span></div>
       <div class="navi" data-view="res"><svg viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="13" rx="2"/><path d="M3 10h18M8 3v3M16 3v3"/></svg><span id="resNav">Resellers</span></div>
@@ -492,12 +536,26 @@ th{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.
 
       <section id="v-cust" class="view" hidden>
         <div class="card">
-          <div class="row" style="justify-content:space-between"><div><h3 style="margin:0">Customers</h3><div class="sub" style="margin:2px 0 0">Every activated device, its plan and expiry.</div></div><button onclick="go('activate')">+ New activation</button></div>
+          <div class="row" style="justify-content:space-between"><div><h3 style="margin:0">Customers</h3><div class="sub" style="margin:2px 0 0">Paying customers — every activated device, its plan and expiry.</div></div><button onclick="go('activate')">+ New activation</button></div>
           <div class="filters" style="margin-top:14px">
             <div class="chip on" data-f="all">All</div><div class="chip" data-f="active">Active</div><div class="chip" data-f="soon">Expires soon</div><div class="chip" data-f="expired">Expired</div><div class="chip" data-f="blocked">Blocked</div>
-            <input id="q" class="grow" placeholder="Search MAC or note…" oninput="render()" style="min-width:180px"><button class="g" onclick="exportCsv()">Export CSV</button>
+            <input id="q" class="grow" placeholder="Search MAC or note…" oninput="PAGE.cust=1;render()" style="min-width:180px"><button class="g" onclick="exportCsv()">Export CSV</button>
           </div>
           <table id="devs"></table>
+          <div class="pager" id="pg_cust"></div>
+        </div>
+      </section>
+
+      <section id="v-users" class="view" hidden>
+        <div class="card">
+          <div class="row" style="justify-content:space-between"><div><h3 style="margin:0">Users</h3><div class="sub" style="margin:2px 0 0">Every device that has ever opened the app — by app and by device. This is your real reach.</div></div></div>
+          <div class="filters" style="margin-top:14px">
+            <span id="ufChips"></span>
+            <input id="uq" class="grow" placeholder="Search MAC or version…" oninput="PAGE.users=1;renderUsers()" style="min-width:180px">
+          </div>
+          <div id="uSummary" style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:12px 0"></div>
+          <table id="usersTab"></table>
+          <div class="pager" id="pg_users"></div>
         </div>
       </section>
 
@@ -575,6 +633,11 @@ th{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.
 
 <script>
 var S={},ROLE='',FILTER='all',SOON=14*24*3600*1000,__auto=null;
+var PAGE={cust:1,users:1,res:1},PER=25,UFILTER='all';
+function isOwner(){return ROLE==='admin';}
+function isStaff(){return !!(S.perms&&S.perms.staff);}
+function canGlobal(){return !!(S.perms&&S.perms.global);}
+function roleLabel(r){return {admin:'Owner',super_admin:'Super Admin',mini_admin:'Mini Admin',reseller:'Reseller',sub_reseller:'Sub-Reseller'}[r]||r;}
 var LOGO="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAIAAAACACAYAAADDPmHLAAA2tElEQVR42u19eXxcZ3nu87zfmUWLJcux4yWLyUL2DRwgQMB2WwhNIDQUCcpa2l5oc4HSW2gLpZVFgTQsDRRKL2YNKZBYuWwNTUgA2xBCVhKyOIGQ3Y53W5Y00mjmfO97//i+c+bITkgc25IT/P1+49EskmfOuz/vBhw4B86Bc+AcOAfOgXPgHDgHzoFz4Bw4B86Bc+AcOAfOgfPMP/zd/NpG2ONdEQJ43FcPnKcPjY1YscL1mrnFKy3pNXMwI8z4hDIR3xd+d2WCFebQ3y/PRIF55nyh/n7Bicu4eA64egk8yMeX4oWnzqy+6e0z+Oxjte3gTo6PjwNrt2H8xlXA1z+zGcDEb2Est3jVKq5eskTj/2EHGGDaiG6yeMkqWb1kyS4En9V/SVfbUccf3zGz81mlthkn0OvhDakeKd0zfHN4+1FaqnShVFURIQwwn5qvj9Il8mi5vWuj37qVlWr5l+PbNm8ik5ubw/fd+9Db/vARAL74//SaucFBAH1QgHaAAaZCtQMCQItEX/jNlc+SmYc+D0nlReW2jpMV7Sc6kXmVahmUIKa+CZgBqoGMufyycDVcuFEA58JTvgHUJ8bG0kZ9HdC8BTZxvdux+af3/dPpd2INGvlnW2kJlkBB6gEG2NtnxQqH3l6AzCVw4cU/e0551uGv0PbOs9hWOc1V27rpAKQAGgCaMBgUgME8LX5dAwgzsvW4+JMZYQxPGgwkQE1EkABaBugArY17WuMe2TH8s4mhjd/F1e/98UMXr67nTDoIQR91fzcRfBpIvETvXAFg3sevWFg57bRzzFX/pCLtL0662ogU8HUABg+DAUoaBMKg3gs0MAMEMum5/AUSgSl2fi2+wcTM1AwAKU4qgKsA1gC0PvwbZfM7fmzo0vteefQtRZ8B3H/NA58uhJ//heteXHnWsW+Ttup5SWf7LKSAjQKmSEkQpgKSxa/F/E9ppCPjv5m8W4Es3OmiEIAGNWCT7YRFTUHAzGA0EBWIVQEdrWuaTvxY6js+++CrF14ZdRGwwhz66A8wwJO18VHVz//v+14i1ZnvbSu3n1vqrELHAGvCgwozuECQKMEZadkioRkAUxRexS6Bvk3+oWgaChoA1mKpnS6dAQY1FQWQsB1wBMYntt/RrO34HL94wdfWX7F8DGbEMhAD+4+PsH8xQEFKFvzHL15UPuqQD/jO7nOScgUyAiPUC+EMAlMfFYRTywgNgFDCIldEPggyH59gxmOW/04gYOE98d7MdrpARIYihNcyPCn8foGJPRS0dhFWANRG7hzfsmFgwxuOuXx/Mwv7BwP0m2BZUPfHXnj1gvrzXvAPJamc79oqrjkCVfUeQgoF0XNzxvDpJdn1S5gHNAWogCkUpkoYjQQpNAMNRotRABkZgJEpLGoRy9ihpRksAoXRZYigYku/TOIpU4XSpCoOCZCOD12Vbnv4H9e/+dRf5GZumiMG7k9SP+97j7xZuud8uFKuHO5GkIIwOpQ0AbQUo7QmAD/RTCea5ifGU87sWpMkpQmBCpVmaaPix8YOVU1moVxRJJVKUiGcBHnz9RDWqaq3QH0JbgFzXxA5ca2gDzK+YK4BJl9Gm2xRNCgFgkBgBLBTpOnrjWRixycf/uTffwirL673mrlBTp9vwGllvhUm6KPv+uRVR8888QX/5jtnvkqbQGJAWweQpEA6WhupNxr3qE/vQlq/BWvXbcERs292j25Jh2+9Qbcvf88jO5l0dva+f/as55/R2TztdN9Y89Cp3UccMZsNO03a247VUunYhiWHa6Ui5gGpA/CaEiYAJUsTMJd629UnKAQOyJiiwBBW5AdrPUc1byYO3UTFRm7uSR49/+Ylx91kZuSyZcTAgP5uMEC/CT4kCjPMvuz+vvK8+Z/t6K7O0WFgbLSu1MatzsZXNrdt+3ltw6Y7Rv5+yQMxut/jM+MfLj6odMrpR8N1vqiUtJ2VSPUl5e4Z7T4FtGYwU2/BCaWwJfEZgY0WicrM+ZsUVaDoKO6ScyLMzNSbd50u6T6oMZaMrf/X25c+66MAfO8Kc4NTHClwGlV+0n7Flv+YcchBb+8YAZKRkdv86PgVtU1rv7vhXYtu25ngh57xybbNrz5yrj/hxHnpqe0it607Bced3K4zE0VSCtCeKlBTSG1C5N7ba3jeKbeX7tzi+ZtbHh575/eHgIvrO3+cwz72o6NkzrP+yHcf9JpmUn2RtVWAGpCkqQcpdJyUHyxKt5nlfkJUBTG0LDBEIcwsMoilqlJycsixRKkx8v0HvnvV+esH+h5evHJlsnrp0vSZyQArVjj09fm2q2sLSta8ps2Vji0N1y7Rkc1ff/TLK67F6oGcQAe974szdrzgOc/BvIPOkK7O56bl6omWcD59MsvKpCUlIInfgI/xjTyQNJtIUlVf1o1pPd1ojcad2LD55mT9pp+ny3+8BqsHRieZjs/e8hIesvCNjm2vr7S3d7EGiHlPUgJwaLl/YBodwYywZrtezoxR8BivkVBv5gB/xIkuYTr6wPCdv3rDHW8+/frFZslqMn1mMYAFN7v87TteVW4/6ILyhPxk/q8fvuCu9z7/kewtHd+4fW7z5MPO9Gn6Ki1XX4xy9Wh0JXAAtBm8e6TxHvAwb5kahjCAtiJKU0AEBjgYnJRAKwHmYipnqAYx3JOkjZ9huHZl4yc3rcIHXrM1+xzdn7vxyKTn0He5zpl/Wmprm6kjANR7kA5mLTUQ6c4CWAi21ET+sKA2jNzJdyRKMH/4Mc6ZjTZHHt785rvOO/Ky6Bzucyh5ahig3wTrlzt32km/h8Nmv1AeWjvYfOfv3wUAi4DSbT99aLF2d/1Z0lFdrO3VBSqATQAY9wbSg8KI9hGQAOwEb12DAKogSQRVgCXAJSFbZCng6wZtNAAf4AJJnLlq2SWdQNIGNAE0Hxyr6Vj9UvfAA19NX3P6tdnH7vqXa49qW3TK+ZaWz5ekUrURr4QSFBbBJ5hNJlPhobXgh9ZzzBAAQkh4A6pl84cudE6TpuqmjX9181mHLQ9MsG/xgqnTAIs+X8Ir5h2Kj7z6AQDAKz5dkfed9xrr7vgb6+l+HjscMAFYAwr6TMwk1/EkoGYwURrIMoRtMVtXB6w5tp0jYxvA0q8tad4u3bM34fpfUOsj9+Clz12HWpMolQzlMtzNv1hgozhOTzvOS3elIo8OnenLyfEm7GapcbPVa1/DgyM/Qt/pOwBg/uduWdScd1S/ue5XuQbAZtNDxOX5BN3Z3qMAIT8G4JghVGQLcjCiu8Ns1jwa2kVqt9/zb3e/6fi/3deagFOm/gEG0GNxIrd/+3WstL0HbdXTvQCoqQJqEBGIRFsbL6hZBuYbyoljO4AmkIzWNlq9drtONK9V0xvw0Ka70Xf6ZgDjT/lzfvRbB+G5Rz8Xs7uOwT0bOso/v+k7jde+834sDfZ41lce/nPMmHNBUqrO0eGmNwlQtCBLCrAAG0eSWQYiF3VAIffICDExXKJZPWads5xPOpHUH3j0k3ece8h796Um4BQQ32W4vvufX7/cDpv7EczqOh0e0LoqYIAwS/xkCEyULHoYiE4IHIBtIxtZq19ltW3fwa8e/An+1yu2PU4SiVgFAquAzZsNvb2TL9zgIDFnDoElwJIow04UOkmPE2/6RDv+6321IlLZfdGtz8K8hf8h1Z6zMeoN5iEizHMFZi3LoIbHUQF5JMkMR2ArjzFvHlFuR8qZkoz+8p6L7v2T4//P4pWWrF669x1D7mOpD0mdz1y9oPSS5/ZrR9fbtVyC1byHgHBOwhWwyfkVMwUF6IJIA7Dhkett69av4Ts3fRuf6NswidirINgMQy90jws6M00VRHLXeLx/ZYKBpSkAdn55/T9Ie8+HqJVEmo3gIBbAoUz9txzBx+ACFn6ImIMZUSkDCw4R00R8qQOJX7f27b8857Av7Asm4L6Wetyw7g2ue9aF1l09VHeowczgMokXZOmaKHQKKNgtwgag2zdfg4cf/Xecc9oVk/72IBAJPvXJlII26PjMfS9D95wVrjRjJscnPEWcFeP/IjpoLGas0MoyWCR8YAARIvVAT49g9sG0lOLZBkw89PCbfn3ewsv2NnS8lxnACItSf8nN85OTn/0Jm9n1BvWANdTDBZvZAtYn5dlTtCERAbB9+3V639qP49xTvpObBlUHTBPRH+u6hUSOL/dff0LpmFO/YaXqqTJcTymSmO4k9gY8oWpiyzFESBXi0EMdqm0w70jYaOofuveMe9646Ja9WVsgezfOFwPp5cp7+uT5J9yoB3e9wY/DWwqFE5dLfFEKjErQ2IMEzfFf6Yb1vXrirBfj3FO+E0q7zUXx8PsJ8QMtSY9+SxoDZ6zBnbedpSPbfuE7qon3msYSBGisPwz3BlODTrrF9ymg3mAaolVVhaph40YPb2TaULVkRtI4/LjB9vd+ZR5eJx79JvsPA2S19medVXE3bb6Ixx5zmbm2Q3W79xBzgEru1WeesgFQ8+iEoJrS1m35d1x2xQvw3AWX54QnbX+sosnPAFOsMFe74IUb3XcuOTvdtOUW31FNNLVULRAX1kINs+csu4+MYBlzeIX5wBhihvFRj+1bUogTada8L7e3H7HgD//oK7DnlnqXBenZH0xApg5N7th8OQ6ZfZ5uUB9RDpns9AggBngzUDxnI7GhsV/hrofejXNPuHoX/+HpciLEjUX9s0tvfcd/Y9b8M9zIeAogYRYeTnYJ0KpVZMt3zUFNgUU5cQIsOKIMSQh4TSuzXVJbt/GDD7xy3kf2RvKIe0H6HUgvqx/8oB2/8F9sGxowlEJGpFhCZTmYQwHYLbQt2y+1r1//blxw9maYJQD2JzW/e6d3hcNgn8crPj3Hnf3mq6Wr5zSMjnqKc0Vo0HbOKAGTKo8sooMWoyPvgVmzE8w6OEHTm7nEeS01bOLue1667u2nXr+nRSXcQ+KH//yKu1/EE474CZoVmKrEtFju2OQpM28qVRFKqrb20Q/oSxZe+LSV+seLEAao+MsfHCyLzrwK0vYcGa8pxEkgke2kBWyyZshEJq9tDYwiQhyysASWBKampQ4nVh+6c+jbn3rh5iXLxvekKWUPfAAjBkG89StVOXzB5yAVZ6kSFmOa3OhF7k9V2S5i6di4v/1Xb9KXLLwQWb/eM4H4wSdQrFjh8H/P2lTe+sAfWX10yJI2Me9VLTp9mU+gGtDDwjWygj9gZjmWkDYUw9s8zAxeIY3h1GvXzJPaznr7P6CPHiueOh25x6r/2g3/zMPnDvgh75E4lxO/6Ol79ZzhHJv1R/TeB1+Dc46/GWYJpijlOQ2aIMEAU3fBI7+nPbN/gCZJ3xRQmGWxaI9RRtZyqhDqF1ul6C4h5hxWynxoo4h619Dar+88c/jdz78xlsXr1GiAEIIoLv758dbT/Q9agw+eS8zh5FU0gfjS6RxHR9fqLb85C+ccfzNWPoOJX4gO/PsP+zFHtv8dKhUHb2q5Zoy5gyw8zLRlUWMq4nPhYbOhGB8JWiBNwWZDoUm15BYe/bE9AT+fGgMEJMx43LEfZ3u1zZoKQJhnQCz+6VRVOpxDrbZWf/Hgy/EnJ9+NlZZg6TOY+Nnpo6LfEn3fgots86b/tuoMB99sMQEsOn9Z4rNw+QooYjHtPD6qUJ9rWMeR1Fer3Ytn/9e9rwOpWGFu3zNAiM8VV991tszq/EMbhYeIm4R6GQCvKh1OkE6s1TvXvRxvPflurFz5u0H8/EosU5gR9937l1bbsRlSBVS1wAMRK8iAgdb1y3yFTGOQhsaEotkIjKPeoF7JBsD2+QNYcWcZd8GeeP7BnvkAIVvBJcKbv3sTerpPszH1MDoUiye9GitCWn1YR3e8CC+Yf9fvjOQ/lsD00eOD974FBz/rYtZHFIxJMHs8YsQyMyKGhMGsqgIdPYL2GQ6qBlJAb167y25saONfjb9h3v/dXZh49zTAypVR+r/Ui1ndp2HUeyCWSUV7BTWjg0piqf7y/j//nSZ+ZgpWmMOHn30JRrddg8pMMVVfuF7xvoUY5sWmxhwxhIY+xua4wacG9QE+9jDqmBoqM/4Gn13ZiV7o7miB3WOAJUs8XvHpCmfPeR+bIWkbcuiZ9Ctg8DLDOXto3QfwhpMux803l35niZ+ZgsHBcP/g2g9YfbxJOobqpqyu0IrweE7szCnMf4ahWVf4FLHuwGCgoN7Ucrn9mPZDT+sFaRh88nR98iYgC/uuuKfPjj3mMhs1jV01rb/k1UuPc/bwlsttyZy+2APnn46TM/aVKeBHNl6EzoPfg9Gt3sS5yXVCzBHTSRaCrcjKjOicnaBUZTQDsViyXBH1tXuGrrr8Ofjqn048WUR1dzRAwLJmHvQuUQKUyZUNnipVJ9g6vNZ+cNP5EDFgXxM/DILaW5mxfXruWmYwoz10w0UYH9qGpCJBCxQc54ImsCj5Wb1MC1zzSCd8ri1MDWoQHWt4ljuPqy56wXkgDf0rk73HACtWhMzcxde+EJ3dL/I1KNQcNCak1EBTAzz1wfVvxwVnb8al3u1TXN9ibW1fn8cAFWYSJ3ntp9jAgGIQguXnPmwjW75m5U6GLmID4y1DAwNhkeMDlueUAyP4usLS+J5QlQaFwacwdM39CwAOWKJ7jwF6e8P9YQvfwraSQFVR5Eqvnl3ibP3WL6D3uCuxcmWyz9O4pAEnlN3n71iKT1zzHJCKgQF9spw/PVoghmkbt34Sw0MjYOJM1TJQyDQmhczAeG2LIWMWKmpT4Zu2E3QMp2MNoFR9Senff3ESBqhPRjMmT0rNkh79X5jFtpnn6DgANZezjkJZpmB4/FH70fX/FIsy/b6VfAA/HZmNlJeDnS+V9KimXr3ly7jx5/+CDy5dtz8OYshzBSeawxfPWIsPrr8E1dnns7ndQxKXG32LNcRsNZaQ2WSTeAm8wbyiVV4e7ATN+3K5veTb57+mCfwS2TCtPdIAWaLhJWctlvbOw1j3mhe0G0GDSZtQ169bhgtevRGD8dPvuyMgjcON90pn50t9HU1oW0m6DnoHX/j7N+Ky+/8XSItmwe0uMLLPz+BguHCjj34FE7UGQLFYJUK05hOY5UNoQLMw6yDTCmqwtBV6h2ISg6mJjRuA8muxuD/BMvgncvSfmAGi9kfbjFdrGWZCDX9TADPPDnG6o3YDXvXsLwdPF/tW6gbjvWs7nGNQmKd6g2713tK2BZhzxHJcsfUa/NevTsvLyJ4CRLrvPn9fMJ+fWnQLGmM3odxJKDwKyB+z2UWmoBnMNMTchmgaAgYAb7A0+APwBijExupGdhxf/b2znwfS0LtC9oABovr/swtnSMqXYQIEQ9Nd9FhJb7B1Wz/SUvtTFPKZNGGQAKIoADhMeMOo92yb9QcyZ+GN/J/1n8C/ruhGH31wEveLaCGL0w314W9CSpHIlhOEWew/SRNkDBJNReyRDOYg3tRgXr2VKvRtc18JADihdw80QKb+X/ayMzGjcwHqqgAkw/pdu4iNjN6A8z5yFcwY5+JNzfFN5sBJNEdwJJw4q8NrWimxc97fynPOvhHfXdsXnMRoFqZ7Mkpv1JLDD3wLtaERuJKDmmGneoHJ4WHLKWQME81r0AKR+Joq1Kto3aBtXS8FIE9kBn47A8yJv3jw3N/XNhdG5GVIlQIqBh3eeiGwvBn/lk2xLAFZbaQBISwNBgKmpkPem3Ucw85DLuN/b/0OvrXmmFB8Ms1mgTT0m2D5H66HpquQtMfO12jvLXYJqUYUsIgKFvwALWiFvAAVtHodcO5EfPi6+a3BR7vPAMQSeADOJW1nykTs0Awcqex0gm071uDsv/teSBBhaj1uk5hJY4sZsgvhQ38JQGd1rzaUqrXNejXbj7oJl697P2ClUEkznU7iKgnoef0HMeNnWZwPKEzz+UKR8JwEFUNzuw/EamLzCqgSzbqJVHpc54LnRL9Jdp8BLI7P+uzKOZDyURyPbw/VZ2YJYKNjnwcGfXhhquHeeEG8Be9Dd7r5eDMIKIIh9TZW7kL3go/i++M/xZfvOAt90+kkRqCmOfxTTOxo0pDEDtO8hJJZQihyOItt6N6A6PxZdAjpEUE5erICaOV5EX/gU9MAALDw0ON8uTLbN33oxleaJOLc1toQfnr3/yvCxFN6VCLhixKh8VaQkBYjOKTesMWnmKi+AF3HXoWvbf4SLrx2QXQSOaVO4kAk5UPX3Auv95tUQvu7FusEo/bOUUDkk8uCutfcD5jUheKNTA0i5aABTnx80/z4X3hVeE3aqqehmoROGDNSVa2dlqaNq/DRP1iX9QRMOQMUpd5b4ZZJv01+LVUgNUItwWhDUaNxxuw/k8NOvV2+uu6dIGNR51SZBRrMBIN/O27NiTvgyoC1RqFnBGcM/7LCkCz1zkhs6s6PQ3GxTDTAVE9B7yfbcgbfLQZYEquRRnURfSwEMYBqTBogtu4IEfmyVdMSWpkPE0CCxBcZIpN+tNRikQm8AZAQbW1vevWdB1nHgs/wkqGV+NiaF06pWciuXbNxa1D9GnMBsUAsOnosRAFx1Hn4jln87zXgAS1QiNqYAKw0tzL36Hnh/1rG3TUBwcdun7lA0mgRvJmVnaRDIxtxzU0/Cn94yfSUdCsDwdMigQE0LdxSA9OWfQwagS1TEXBWh0bTbGjCG7oXc86RP+HXtnwMn7nhoCkxC2s2B805tuNmNsYNJsx7x3SyukcEgaihuQo+1gNkaj8vHgHgjfDeg9WqdR19XDADu8UAFqZ5nPKmDhurHYsUgJqQ8KGsLf0fLO/bEWsEpifXn1rUAFHamzbJFNBbjpDR71p9k9tNGCHiUG94S11ilYPeh5kn3yxf3PzmHFJeYW5v9OHtck64K1678XusMeYBEaqZZfbcWna9peoNLHSeZhnB8D2jhssYBCX49p723QeCMpJ+8D0JZnR3hGnrhKkJPYDmaJD+VaumD1DJVX9UhYoWoWOnLWJFgk0quZ6sTvPnSQeoYfuER6PtWVqZ/TV+aegKXHD9opDZ3AdmYWBZuNJrrh2BplsjfDH5800CgopT8SyLyEIeKccDcoYxU0K3D50RIoFVu6EBMnux7pEeOFZClbcYEidpo1HD9pEbIwNMX7atGdV/wdGzSY6gFbzjncLDSeAKix40QTg064oddW/SfQ4OPuVaLt90Id51SRf6GNqy95pZYEgPX/v+7eY67gUSwKA5DKwhvkexVgCa954zvoeZE1iICDSbs9U1t7T7GuDEEwMDjDePs1KlDQqFebACYHziQXzmi2vBAgdPiwYIhOZOIR8zwu4SCgZTwPgcdacQsngL20YcanWPeqnKypy/4/Hn3YqPP/haDERIeS/7BqyPuqwWIFP1UnQAteAP5Awdk0WRCTL1b/F1pgZU2p5KOjimALtnOzjJOpktSQCONe7A9ReNQ02mtdbPM6j35uTQz6LnT0WMAIK5YMEUMMcMivcFPyHDF0AHS023j3vzbUeiOn8QF227HP23nRTzCnvPBNZHvKnEz6FB+lUnFYVSLeDtuf2fnBLOTZo3wJTQFNyy9qjorOvu5wIOmt2alw6aEHC+eVsRJ5i2o9Hr1xDe5dKdtrJjk01AZiYyv6AlbS3ia/7enElSJWAOzZpioq5o6/ljzHrWDXjfLaeDwB5rggymLXf8KmoAK7aIZRqAaFULocAQ5ieDRPnvqhFpCpo7FAAhoo+VFPrtH77SXsTZpemBtD56DwBg8zRvw3oMwGdSyOcnYwHmW5Kda4IcP9jVd8hz7NkNTuASQa02gWp3Ow5a8G6AhhP3MLOYOWeVno1F75/ayv0Hz98gmFw/CENeN1AwX7FML75P5LeG6U9cEpb9B6RorQEMj/8q4svTywAFp440PMbup/wL2M5j6FAc3Voc775TFLRLZKQhnZwA8OmGvZzcUmaXWiL2nyWD4hQRZg/DbMXJcycZzR4L8ycMMK/ccwZQGMsEGvUN9sP/tynYFBgGppEBGmnQXz6UKJCWJyvzid4ZkMJd0rGtUW5EXoo1mSmsdWVD1aVHUk1QEsGmTVfioVs/tlezoPWRmah0BYn2BmnVg7cGTPtW30DQSoUvlxVp0fIiQfMG1ieyKwI8Rl74t5uAoaHw9ShGBxDJFgwObIuVitNsAgrOX2a7fQvgsUKiKPcJ8seTE0bmW9HVJAdRDUi9h5Kodibw4/dhy4NvxPvnno3l526JXLdn1yEiqRzbvijYbCMzSM+3wkAWHL7W50NL7cdJY9CoCdQAOKBtRtDYl3m3G05gLLxb++AEJlLAQEeAQ5szZYNpP/EihPg3w8WjM5iFh1lUoJPtOzN0MHtfwd6bZwYzK1L1KHc6ijYwvvlCbLju+fjwUd8Ijt9eRgYrnUpL89AuIyxhEIsOn2rO7JahfTmG0Zo5F/MJwS6WZ6z/bUDQY5uA3t6g1o465A6oDoPaZRRw7kHXAzCoTv9MnzzMs8njiLJZw2Y72fw8q14Y6V+YZJL7yAYAKVw1QckBjR3ft4l1H8TASSH62dsLILNp0eIqMB8rgVo4UT45IPuS8TOyuLZAs/dKNAEaK7YNGN7U9hRwgHge2trg+EQ+ytdK7YUNG72ueuTfHz69JkBD0if+zFSB1IesX4SGOcm7R8DLFZACaMQ0yyeoR1PBUlcCrd+P4Ufehg/0vBIDJ92W5wP2asNLfyije/kXetgYP0LSFPRhpiINObjTMgPBLOR5gUyjZaViOSpooCotTWGa3h3AvSX25Bkg47TLvzfB5sQmEYEAkGZasCMnGP38Reidpto6j5Zd9Aam2gr1MobwLSZgBISyC2dZ8iTYfEPqPaTTQZlibPMncO+3FuHDR3w1zwhm+YC9efrjfffxc4jSTKZN0CR+3uKoUW3F+GoFIKhgLooMrbn/AiZt9xet+pONAgyXrXDo6xtD+0X3IsHRIV8SG0JXgcCAL5UvrYzfemWCfdkJ9LjRSZB0ptZSi9lk/uI6+Em+ffCoDVlvi4Xdw0mSSLnNWX3opza++e/sohOuz9V9MHX7xuFdtUSAAYVLTqZrc2iOehhc7l9nA6VYqLkh8sHSrfdEn1zZ+s6ksDGWcuvd2/FbOODxw8DYD2jNkfstaQ8QpIsXYtVdIVJNS/PbdWPPGLChuAhlKg6bACQ6R8VdHCwGcnEid+G6FJwIBYRs707ohx/F+Pp/tgsO/zIAyxtcpmpMbanreICAhvJK5rFstoRC88Ywxt32u+6tZCwUyDZelgg/MZbOLAUTMNi7m1DwqihX4n8ZVzAAmCjHbFH43CwdkmjnoTGemdrQIEt2pAWvPhaBIA3wsKQK5r6BgSnAVI1p09O1iwgp4+u/qMO3n64XHP6lvFx7X6j7xzpLAj4vxucg9cE3KdQAWLGGIWv8UG2hfGq5Q1iczWhqRimDlPtw7fLxvJN6tzTAkuiLpiNrMDFhrFaoG7YvKuBwUO9nJJaeCuBm4MSpYYDBVhhIiWVegnyBo9EgkwavtqA9M3i6kmOl05kfuxa1tf3+s6f9eJJ3P2UNpRaaV9/08Q56PUVsHNTQbNmapm+tYJOEZOtnItxHoBUKMIvQDQSVSEQNt2LNYAN9cI9npp+wJAw/vf0+SZsbIYBVOjsBAGvCa97v2KxsviiC2lOqAcRnHrEWUsI+SHwB9GFwEJWpQspdjj7douPb/spfOHuJ/+xpP86LQKd6Knl/oF9b7YyTxeQI+olQG6AFSbdM0jNQqJD21YKTWChyyYAsM4WmdgsAYNPjF+4kvzU+DWNcN9nLtt1tCeahsy3M+hkczByQXxn11cHzGpjaC+gNpII+G0we5Z2FoD6YSs+kLYE21ca3XVza8Zt/Hv/60rWB6INu2sbRr1olANS7GUtLboZYc0dqsCRHbFvLCHNpzFcU0/JZ3FZArKNCMBqcNUYsaQzdlmamZvXu4wCGVWFnow3XrjMFWJ84En97+UKgzwOAOrcO7Dh+5jFfOyVCElOXIs5i+qgF8vg4D/W8Jxyl1JOwPnqDS7cvTj932J+Nf33p2nwXwWDf9IFZ0f7TeA61CaoKi7ODCy14Id1bDAcL/YM7lbtRzcAyzXRtfeSXawC0ehB2GwjaPBh+ccPQD2U0BSqdHXj2CQsyzzPF0ANE4qzR8drI1lPGANpsAqmHZBnBLOZPTdE0ZdLtaNyK+vb3NW798Evqy4+7Fr3m0N8v076EIk4VL5915bEweb41aqFHwDSv79859m81wSCHi/MC0QwECsJgdBWYb/wC333bUICt+RQZoK9PQQB3PHAjxscf5AwBGukpgQLGCW5dn6bDa9X7N+OEFWVg6RMOJNiL6VMLSQ8GdahmSH1KlkToRMa2/hcaG57f+MKCT+CW5c0wz59+Ola073LWRMS30vN6Jp0lS1ONrd3hpsUqJY0dn5o/phWTQxEhnDShHbDG2DUFU/MUoWDAoOaw/NyxVPC9pAJzBx8UNMByJHhooO7FfimuZ2HPaPqy8CsrpkQLiLJMhcKrIvWeSrpSTyKa3sn6+lePf/WIN0985ZT7sXhlWDE9nep+Z+9/kB5nfLKNrLwezTrMjK36fm11AhfuqS14OLSDa+6qt4ZQm5nR2cSOhjS2hQ0sS1bt4YiYLOxau/kKqYE2o+N0AMQtGQaR3GQe8Jb8efg4vTY1DKDfJ6oCq5bFzXROZYSN7R+YsfbSM8a/vuh7oXq3X7B6aQpg/5lT2BvW4ZbnLl0qUjkOjVGFmrBYlZRBvrarjc9bxkOxB8xapsLMFNIOVX9D41svvzeEmr9d4z1xQUhfHD16+rKf1S/8+3utWnoe3npRN5bLEAC45sQtao+OOVde0nPof528fS3vDEmOfaRqB+kBY/MSXpK87u5ZkJlvZTp0P/wj/zw6+NI1o0BY3zKwny6hOCGm9hr1v0apEtK21FYVT0T1ivu1EDfXB48wQtnZahkrjI9SBRJCwcsBAItXOaxGumcaIPzXglsGxmz7jm9yRvscnP6io7Mik0RGbiewSa05w1v5r8PXWLavgWADgPHLjv/0+DfnL6pdesRrRwdfuiYkpmw/Uvc7S/8KhwFqsuTHLybbXyYTowpVh4hl5Ikd1VgDoHmWz6xVxcxikqj1swHibGKsljZqVzwZ9f8kGQDAslj/f9N1X8DImGLugjMBAj+2ZPv67WtJ3Bexqjd2L1xxWmDV3n2fJQyZSMubNQa5f4+lPaE3CHal/YOwUj4vuEhQmsbmz6wkvOD05dtGWgMkTfPHStduahM/wree/0CINAb2EgMMDIT+uI/98VobrX0bM2a8FjDgmyAwoNSJH9CgMFTh7UOZsdv3sDBD1JE1a+zPJ0p/+9m3nCWovIKNIaXBtXD86O3HVDBtcgs4C+1hZsXHrZkA5pVMdywHYFmksXcYINAz1KCoDqDKk/DhHx6C5WEKeLPsrwatrjY+Ck3P7j7yG78XwKIVU1Er8DQYRB0R/Vd8upJOTFxI9aAqVH2sT4yQtrY6fk39pKVSLYBId50rrOYpbUQ6dmujsvGqPNLYqwxAhpzkefPugK+vxkmH9yGArW5snqwxJ/eJuaqmWue4fGz+/M+3h4hgPxvUOF2e/2CfL4+d/L/JjlPQGPMwShbDs9DKRvXIfQK/kxZoVfvE3sDs91MQjmL2KQz2+RBpPMloare+yLLomm7b/BFUyi8D+gXLVhG3vKNJS78NSwnTbeptUc16lgVfYJn73aZ+8E0qi6872tD2T5wY1jDfsGX7TWOrUt7hpJN6Fa3QBpY1goRiFgNUlVISS7ffP7bl5m9H6dd9wwADVKgK+k66ERP13+DSVz0fA0vTkHcZvdQ0XUtaYpjYYJq+s/Pwr7wYGEinyBTsj4dYvEoAkKb/6Sgz6VOjKhElHTo5w2caS9kmjX1R0Hx8HKIBiX2CoWakQtWRi3DdX4xE6bd9wwAhIghZQm3+JyodYQrVP69MRh59168NuAEmsximCJZdc8aXehat6AbuslgA+bt1Fq90WL00bT9z1QfI6h+wWfMAXE50m1zMkU0AyWYDIap4y9C/necGqCqlImjuuHdi+y+/hP5+2R3pB4Ddl8zVqwMucP7rNuOkc56NF503jH85ZwgAKu2vHAPlPEcx0iVk1zzUGkfWR945CPxvedzKxGek3TeH/znCd7z02qU+5ZelOWYkhNbaFV2c/ZOVrdOKTaA7FbZY4eeQC1a6isCl72yu7LsNB68SrBnYxwwQmCDct5+0FiMTc3HXlRvQ3y+NK4d/09Y+4wwzHimkM5tIoelJ5e5X1Bojb7kOWJkAF+szn/grHAZP8jOe961jUm2/RrTZRksZ61ZbNX8FDcBCTMNsq3hoBGxVNRX2CULNM2l3SGvX1brWvQ+9K4jP7T4Gshc99BUO6PM9c7/2erDjm+bHx41omqU7CN+ubuJvRjacf0lggqXP4CVSJgC1c/HNs/3Y6A9pOBU64UFxcXxp7E1k5AZm9V+I1byxdQV5MasVVseBBMSMdIqkAtXtLx5fddYN+eLq3Tx7apcLDNSngHG7zPyema4BWIGlowSoJjXRjk91H3r5HwXif770jKR9yL3r/MXfm22jw//D1E5Fs+ah6kJ4V4B6tVjAUoB5vQ8lXaqFvge0fAYAUHhKm7N0/N/HV511QwYyPZWPvKcMYJN/HhSsP3cM6fAF0GYD6ndAVYXiTM3Y5DdnHfKd1wLvaAZNAD6j1P4AtfvUi2YOb0++j5TPY3PE05uD97DUh+rkrKNHbXLjx05hX+bxh1DPFyqBUxUkiaXjvxpLXX+AwHufslndy555nwf6ZWjrw5fCmlfRrM0gSmMVTMq0esnS5mVd8776jqAJ+vmMAIoWr0ww2Oc7F31vdrP57Cug5eezOZJS6Zi1qGXAjY9EzcbaZpU83ueNrq3UsLbqAGAQmFElNP/JxF/hujNHsGZwj/ox9lFoNpA66kcNUhawzSglAE7NaubrQ/C4cOaCi/8ppIxpT2ucYPHKBKuXppVTVhxh9fariI4XM62lUEssr+R9rDY2zRG/vBLY76wJWhVBMIN578V1OmrjgtpP/mAles3taeZzH0lfcAhnzl5+IbT0ToiMkiyboWnwdVi6w2jddLxSXf0DI4++ayvQnwAD+64Na+8b/Cg8A9p94pVLfFO/bnQLoPWUlCT38gtT9ovDSOKMhegDZn1MbA2DYKGdKSFAeCadjqxfO7xw2xKc0GsYyEpD9jsGCGp9xoLPzkoaM35m4AIaahY0WEPMvEEbRjdXXNt6kdK7t63/42uKzLNfo3tY6bJIZsZxV/4f8/wIrFmFNTxIZ5BQp4hii3pWu205YfM29Z2xu6zJQ8LNHFSkIhDdlJb43PHr/2Dd3iq62Yf2N3jEPXO/0Ue1y0yb6wszrRxBFyIe1wMmMMGnpDP9yLbfvHk4/O4y7LOqoj3UbADQdfS3jkLKT5lrf6VpDUS2Sjf083ESwXea57PTsKJdvSCG5lVHQGAmzqRUGbcSXzF6w9JrA86wd4SEU3HBeg6+5GKk+nogfQRkyUwqQjqGdmNT06aBnaD90jjxoeHN77i69fu9ceLBdEr8Cglw9oBi0edLHdsOfTf8xD8K2AOre9AJIK225F06URmHgsau3nyihRUkvvBzdnM0o1OW2h1k85+O3NZ7ceZz7MUvt09BEQJAd/enukVmXgP4HhAqTKoGtJHizMyb+gkIagYtw1wbE7vaJXrRlkf/4tbW3xkUoFenruIn+z9bktZ12ODLzeQjkLbToaOApWlYomwkHUGJ+7R3nj9WsOs5nBtaeMLzgtbSaANEYAIzipdSd2IV/ZuRXyz91N4m/hQwABBKwwb9rFmffwHNXQrQSDgFyxRXhpmpYoJiTVPfAEkTOViQqLJyJVH/7PbNb7luslYBconcJ0TPQtoQ38+4vvNs+Nr5ps3fJ1Ayao3myiCSHKOlkJQWosuWEVBrTYJBbhistRE8dwaj+hcahIqky0HSfxy+++UfDR7/3i90naIYvD8BBtJZs770Hnr3cYo+omCVZIJ8yql5ECmFDjCFMgFcD4hxCn5KNi+dcM2rR9e/Y8tjE+wuA5ZZcdDPExN7GVtdzZO1S+e8FXOc4Vyg9JcmpdOpDaiO1ZRoxqROAqODUEC4OJsCJAUM5oCWrXzXluNniJ5+nPWXaYi8C1jN6DRJupxx7MM7fvPqf9oXkj/FDJAR6i6b0/PsL5g1XgdgM8FKoZcFCjrG0R0MnZ+N0CAt3YBUjFxraP6EqKzUxF23Y+OfPPjEkvx4gNWup6fn4sMhbWd6yh/CGi8m/GFhiBybMCEAMbGmtYZhUIDEQoE2o+8nBomMkM13ynIAklO7hfHHdu9sDwgBKXWKJPr3239zzscAc3EcFp7GDNDyB7BoeTLnvtJ/mtprKdiotKhG4Wh0gDgjxWAqBh94AapKmKAKoJ0sVWE2ZMJfQCduVOqtYnpvs4n1o4c/Oow1A40n+jSzZn26i+xa0PD+GEKeQyu9gEzOgFR6wsre2hihw1BTkM7IilHEst05RmQ/0EQAJMzHd5qBFAqcKXxoXs7bfgkaSXGEo2VTQKApKAmlCpTkr4cefOW/T0XibIph2Cg5/f0y51OH/pupf41RtlFYBaRMsJx5yHHwi1hMo2m4TKkRDcAsVMayokSJNBowBsM2I7cD2OGkaxQiqWnDmzWbDJrEmaVVMz3YrHQIoLNhaDczkGgC1CifccYEzdQ3LEvMiTgACRmIGIeF0wiJewoZhtSokmG2Go0SqZ5pfxdu4kARhPIaD7IkTHZo2b9l6JG+72VmcwpCnKk++cQeO7j7c+8xTd4DikLQhLFKSBKNuALmjJlhFhOYV2oYEG+mUZhcVJNmZmKUdoBtZNIJOMCa3mATNDWzbIcIGmo2kZVmENIaskpzFox2WJxo5kNQbikAUpBEjy9C6SKghTXtgZPECvvfw2YjJShixgRgYKBWLs0719Hh2VzjHN+6dUPvzVOZMp+uREyeBJ/d84XXOZ98zAyd5mxIzCoAHSGh7DFs1M0ulxpUw8po0hhJqiRBB0S7G9CYMEKSlmYGlxqmrIQEqzkDxcgSyVIQd6Rm6hlxh1CUE2cehPasYA6gFlx+KcUowAhKSPeoBZSXYmFarwHGUCDDcmQeF6c5lslyCaXkkmYy8jcjj75161TXS0xzJi6oublzv3EiJuqfhuKFBt0khDeTCgGJ45LSvFDOxCGIHZXwCvUkBSYJLOy0D7SzlKSGKZp0Ga8I6bI3KDMcjoK4tpEtMQ7tmSGwR4jNgqPHoG4C8he0O0MON763EOsRJGmicYibQErhRTeLTLYxwfu3bOlbPl0w+DRn4VYrsMLVaq/fWHtV+esdDx1tNDvVzByJOsGytAKo6GjH4CksCy+J0QnoGBadZasTFGYmhgQhZANglEgsC+GnCAAxqsQJwRJ5IhsEHA23StQsAmO25z2CvTGEt1wLxEXv2evZfDWTMG45BZQ0nYGEV7Fafv3WTb0/CLj+KgAn6TSo4v0lsxZAnTlzlp/GCftHgmcKEjFYPWPUHGaPIyEzDDVKdErRouqM0bcRSgFFxBhDc5M4WDesWzR40CTs2QpLJYMvIK0tA2Y+2PpMl+Slm46gBVNBgkxag3vAOOy14YxVgrOUeIDUj27b8bav7g/Jr/0kD786XrEVbmzsLetr57Z9q/uhZ2+lJc+jYq7RJjK7yiKmFpvj4/YglVg7QSJ7XgWkRc0thAvxg3ha3CGaES6OWozvI40hVCNIqFIkT97BaDFba4QpLSyuZ77YhWQwK14MiZjrhrBpDl+kk7/cNvTWn7TygO+c1oTXfliN09IGRxz8jbmN8eZfAfanSjsYpkMwHTOwHJwseFLTOB/UBVVMtTByM2oIEYW5AMIEAx2XsxPRPQ87RcwTIoRJbINzAbY2yZI4wakLW32CV0matUp6YzQR3H4zMfIgWlnEVa5olO2jOzb33bY/SP1+zgC7pl7n91x8OLT5J6b6Oqo7yqg1gdTC0ETEsC3Y4OLgeCUkhgrRTtM0xGCKAK8ZzdQCapcEUI6Mszbz6ZIUOmRwdXAAPcJbGRkorKsyS2noIKXLiB1GXK2u/MXt29/480J2U/enFvb9vB5vckau+/DP9bRva/9jY/OVND0RZCdNPExHDNAAprBkYIkRgFcaaPBxHW4YrxGB+wzg0RYgQCdMVMMIDoJUU4+APGmwDmF0XsQdNA4nrsJQNWgT4CNw5R9qG762bcOb17S0GrD/1Tc8bapyd03Nzp3x+Rc4wbk0vISKI8zYHiI8G4cQFoCbgNQylGHCzJuYhN2cRpiQsCRoAIbwjpmtCJ03UftTzRoR1BeAJRrbEFZpGmAbVZLrPZvf9Zj40Y4d58cJ3ftrYcvTjgEenxEWLuyvpkPzzqCvnGm0FwN2DI2z1ExBXwc4brCUgtRMm4AjYS6ockliXOGCxIszIjGDp2kcLsUEtIqBCcGqqqWgqxOyAeJuEud/7MujP9648fxNk83XvkhX/84zwM7O4onc2Zla0PMfhwnKJ2pqJ3j4owWYK7T5ZugGWA0OgZRCGAgxk4QZgCSAmTiCpWATfF2JHaDbbuK20UprzJq3qcNtmzrb78XavvFdP8/+ZeOfwQxQ/A79Ma/flwFBk16fP/8TB2EEs6XUfoRXdsCaB5Ol+WCpDVA4S0oKQNkcN0u3UasbJKlMqG3dkEj5N2gf27Z27d+OP7ajCjzdiP5MY4DH0Qx3xanRe0sN5zUN2d/d45Ls/eH8f8Vus4c8DTlYAAAAAElFTkSuQmCC";
 function $(id){return document.getElementById(id);}
 function setLogos(){try{document.querySelectorAll('.zlogo').forEach(function(i){i.src=LOGO;});}catch(e){}}
@@ -589,25 +652,45 @@ function logout(){var t=tok();try{localStorage.removeItem('zadm_tok');}catch(e){
 function startAuto(){if(__auto)return;__auto=setInterval(function(){load();},30000);}
 function load(){api('state').then(function(d){if(d.error){try{localStorage.removeItem('zadm_tok');}catch(e){}if(__auto){clearInterval(__auto);__auto=null;}showLogin();return;}S=d;ROLE=d.role;applyRole();render();});}
 function applyRole(){
-  $('rolechip').textContent=ROLE==='admin'?'Administrator':'Reseller';
-  var admOnly=['modes','forceupd'];
-  document.querySelectorAll('.navi').forEach(function(n){var v=n.getAttribute('data-view');if(admOnly.indexOf(v)>=0)n.hidden=(ROLE!=='admin');});
-  $('resNav').textContent=ROLE==='admin'?'Resellers':'My sub-resellers';
-  $('resTitle').textContent=ROLE==='admin'?'Resellers & sub-resellers':'My sub-resellers';
-  var rs=$('resSub');if(rs)rs.textContent=(ROLE==='admin')?'Drag any account onto another to move it. Top up credits, reset passwords, control API.':'Create sub-resellers under you, top up their credits, reset passwords.';
-  // admin-only dashboard blocks
-  var admBlocks=[['liveHead',1],['liveStats',1],['byappCard',1],['recentCard',1]];
-  admBlocks.forEach(function(x){var el=$(x[0]);if(el)el.style.display=(ROLE==='admin')?'':'none';});
-  $('licHead').textContent=ROLE==='admin'?'Licensing':'My customers';
-  $('dlEdit').style.display=(ROLE==='admin')?'':'none';
-  $('unRow').style.display=(ROLE==='admin')?'':'none';
+  $('rolechip').textContent=roleLabel(ROLE);
+  var staff=isStaff(),owner=isOwner(),global=canGlobal();
+  // nav visibility
+  var vis={dash:true,cust:true,users:staff,activate:true,check:true,res:true,modes:global,forceupd:global,api:(owner||!staff),downloads:true,settings:true};
+  document.querySelectorAll('.navi').forEach(function(n){var v=n.getAttribute('data-view');if(vis.hasOwnProperty(v))n.hidden=!vis[v];});
+  $('resNav').textContent=staff?'Resellers':'My sub-resellers';
+  $('resTitle').textContent=staff?'Resellers, staff & sub-accounts':'My sub-resellers';
+  var rs=$('resSub');if(rs)rs.textContent=staff?'Drag any account onto another to move it. Top up credits, reset passwords, assign roles.':'Create sub-resellers under you, top up their credits, reset passwords.';
+  // usage blocks: staff see them (global reach); resellers don't
+  var usageBlocks=[['liveHead',1],['liveStats',1],['byappCard',1],['recentCard',1]];
+  usageBlocks.forEach(function(x){var el=$(x[0]);if(el)el.style.display=staff?'':'none';});
+  $('licHead').textContent=staff?'Licensing (paid)':'My customers';
+  $('dlEdit').style.display=owner?'':'none';
+  $('unRow').style.display=owner?'':'none';
 }
 $('nav').addEventListener('click',function(e){var n=e.target.closest('.navi');if(n&&!n.hidden)go(n.getAttribute('data-view'));});
-document.querySelector('.filters').addEventListener('click',function(e){var c=e.target.closest('.chip');if(!c)return;FILTER=c.getAttribute('data-f');document.querySelectorAll('.chip').forEach(function(x){x.classList.toggle('on',x===c);});render();});
+document.querySelector('.filters').addEventListener('click',function(e){var c=e.target.closest('.chip[data-f]');if(!c)return;FILTER=c.getAttribute('data-f');PAGE.cust=1;document.querySelectorAll('.chip[data-f]').forEach(function(x){x.classList.toggle('on',x===c);});render();});
 function go(view){document.querySelectorAll('.navi').forEach(function(n){n.classList.toggle('on',n.getAttribute('data-view')===view);});document.querySelectorAll('.view').forEach(function(s){s.hidden=(s.id!=='v-'+view);});
-  var t={dash:'Dashboard',cust:'Customers',activate:'Activate a device',check:'Check MAC',res:(ROLE==='admin'?'Resellers':'My sub-resellers'),modes:'Player modes',forceupd:'Force update',api:'Automation API',downloads:'Download apps',settings:'Settings'};$('ptitle').textContent=t[view]||'Dashboard';}
+  var t={dash:'Dashboard',cust:'Customers',users:'Users',activate:'Activate a device',check:'Check MAC',res:(isStaff()?'Resellers & staff':'My sub-resellers'),modes:'Player modes',forceupd:'Force update',api:'Automation API',downloads:'Download apps',settings:'Settings'};$('ptitle').textContent=t[view]||'Dashboard';}
 var PLANLBL={'1y':'1 Year',lifetime:'Lifetime',trial:'Trial',free:'Free'};
 function planLabel(p){return PLANLBL[p]||p;}
+// reusable pagination: returns the slice for the current page and renders the pager bar
+function paginate(arr,key,pgId){
+  var total=arr.length,pages=Math.max(1,Math.ceil(total/PER));
+  if(PAGE[key]>pages)PAGE[key]=pages; if(PAGE[key]<1)PAGE[key]=1;
+  var start=(PAGE[key]-1)*PER, slice=arr.slice(start,start+PER);
+  var el=$(pgId); if(el){
+    if(total<=PER){el.innerHTML='';}
+    else{
+      var nums='';var from=Math.max(1,PAGE[key]-2),to=Math.min(pages,from+4);from=Math.max(1,to-4);
+      for(var i=from;i<=to;i++)nums+='<button class="'+(i===PAGE[key]?'cur':'')+'" data-pg="'+key+'" data-pn="'+i+'">'+i+'</button>';
+      el.innerHTML='<div class="pinfo">Showing '+(start+1)+'–'+(start+slice.length)+' of '+total+'</div>'+
+        '<div class="pbtns"><button data-pg="'+key+'" data-pn="'+(PAGE[key]-1)+'" '+(PAGE[key]<=1?'disabled':'')+'>‹ Prev</button>'+nums+'<button data-pg="'+key+'" data-pn="'+(PAGE[key]+1)+'" '+(PAGE[key]>=pages?'disabled':'')+'>Next ›</button></div>';
+    }
+  }
+  return slice;
+}
+document.addEventListener('click',function(e){var b=e.target.closest('button[data-pg]');if(!b)return;PAGE[b.getAttribute('data-pg')]=parseInt(b.getAttribute('data-pn'))||1;render();});
+document.addEventListener('click',function(e){var c=e.target.closest('[data-uf]');if(!c)return;UFILTER=c.getAttribute('data-uf');PAGE.users=1;renderUsers();});
 
 function expOf(d){return (d.plan==='lifetime'||d.expires==null)?null:d.expires;}
 function classify(d){if(d.status==='blocked')return 'blocked';var e=expOf(d);if(e==null)return 'active';if(e<=Date.now())return 'expired';if(e-Date.now()<=SOON)return 'soon';return 'active';}
@@ -618,17 +701,39 @@ var APPMETA={windows:{label:'Windows',color:'#1fa6e8'},android:{label:'Android',
 function am(a){return APPMETA[(a==='windows'||a==='android'||a==='ios')?a:'other'];}
 
 function render(){
-  // credits badge
-  if(ROLE==='admin'){$('credtot').textContent='∞';}else{$('credtot').textContent=(S.me&&S.me.credits)||0;}
-  if(ROLE==='admin')renderUsage();
+  $('credtot').textContent=isStaff()?'∞':((S.me&&S.me.credits)||0);
+  if(isStaff())renderUsage();
   renderLicensing();
   renderDevices();
+  if(isStaff())renderUsers();
   renderResellers();
   renderModes();
   renderForce();
   renderApi();
   renderDownloads();
   renderSettings();
+}
+function renderUsers(){
+  var seen=S.allseen||{};var keys=Object.keys(seen);
+  // filter chips (build once per render)
+  var uq=($('uq').value||'').toUpperCase();
+  var list=keys.filter(function(m){var s=seen[m];var a=(s.app==='windows'||s.app==='android'||s.app==='ios')?s.app:'other';
+    if(UFILTER!=='all'&&a!==UFILTER)return false;
+    if(uq&&m.indexOf(uq)<0&&String(s.ver||'').toUpperCase().indexOf(uq)<0)return false;return true;})
+    .sort(function(a,b){return (seen[b].last||0)-(seen[a].last||0);});
+  // summary tiles by app
+  var by={windows:0,android:0,ios:0,other:0};keys.forEach(function(m){var s=seen[m];var a=(s.app==='windows'||s.app==='android'||s.app==='ios')?s.app:'other';by[a]++;});
+  var tiles='';['windows','android','ios','other'].forEach(function(k){var meta=APPMETA[k];tiles+='<div class="stat" style="padding:12px 14px"><div class="lbl" style="font-size:11px"><span class="ci" style="width:26px;height:26px;background:'+meta.color+'22;color:'+meta.color+'"></span>'+meta.label+'</div><div class="num" style="font-size:22px">'+by[k]+'</div></div>';});
+  $('uSummary').innerHTML=tiles;
+  var chips='<span class="chip'+(UFILTER==='all'?' on':'')+'" data-uf="all">All apps</span>';
+  ['windows','android','ios','other'].forEach(function(k){if(by[k]||k==='windows'||k==='android')chips+='<span class="chip'+(UFILTER===k?' on':'')+'" data-uf="'+k+'">'+APPMETA[k].label+' ('+by[k]+')</span>';});
+  $('ufChips').innerHTML=chips;
+  var slice=paginate(list,'users','pg_users');
+  var t='<tr><th>MAC (device)</th><th>App</th><th>Version</th><th>First seen</th><th>Last seen</th><th>Check-ins</th></tr>';
+  if(!list.length)t+='<tr><td colspan="6" class="empty">No app users yet — installs appear here the moment they open the app.</td></tr>';
+  slice.forEach(function(m){var s=seen[m];var meta=am(s.app);
+    t+='<tr><td class="mono">'+esc(m)+'</td><td><span style="color:'+meta.color+';font-weight:700">'+meta.label+'</span></td><td>'+esc(s.ver||'—')+'</td><td>'+(s.first?fmt(s.first):'—')+'</td><td>'+timeAgo(s.last)+'</td><td>'+(s.count||0)+'</td></tr>';});
+  $('usersTab').innerHTML=t;
 }
 function renderUsage(){
   var u=S.stats||{online:0,today:0,week:0,total:0,byApp:{},recent:[]};
@@ -653,19 +758,20 @@ function renderDevices(){
   var list=Object.keys(devs).filter(function(m){var d=devs[m],cl=classify(d);
     if(FILTER==='soon'&&cl!=='soon')return false;if(FILTER==='active'&&!(cl==='active'||cl==='soon'))return false;if(FILTER==='expired'&&cl!=='expired')return false;if(FILTER==='blocked'&&cl!=='blocked')return false;
     if(q&&m.indexOf(q)<0&&String(d.note||'').toUpperCase().indexOf(q)<0)return false;return true;}).sort(function(a,b){return (expOf(devs[a])||9e15)-(expOf(devs[b])||9e15);});
-  var byCol=(ROLE==='admin')?'<th>By</th>':'';
+  var byCol=isStaff()?'<th>By</th>':'';
   var t='<tr><th>MAC</th><th>Note</th><th>App</th><th>Plan</th><th>Expiry</th><th>Left</th>'+byCol+'<th>Status</th><th></th></tr>';
   if(!list.length)t+='<tr><td colspan="9" class="empty">No devices match this filter.</td></tr>';
-  list.forEach(function(m){var d=devs[m],cl=classify(d),e=expOf(d);
+  var slice=paginate(list,'cust','pg_cust');
+  slice.forEach(function(m){var d=devs[m],cl=classify(d),e=expOf(d);
     var tag=cl==='active'?'<span class="tag on">Active</span>':cl==='soon'?'<span class="tag soon">Expires soon</span>':cl==='expired'?'<span class="tag off">Expired</span>':'<span class="tag off">Blocked</span>';
     var plan=d.plan==='lifetime'?'<span class="tag life">Lifetime</span>':'<span class="tag" style="background:#eef3f9;color:#455872">'+esc(planLabel(d.plan))+'</span>';
-    var byCell=(ROLE==='admin')?('<td>'+esc(d.activated_by==='admin'?'Admin':((S.accounts[d.activated_by]&&S.accounts[d.activated_by].name)||d.activated_by))+'</td>'):'';
+    var byCell=isStaff()?('<td>'+esc(d.activated_by==='admin'?'Owner':((S.accounts[d.activated_by]&&S.accounts[d.activated_by].name)||d.activated_by))+'</td>'):'';
     var actbtn=d.status==='blocked'?'<button class="g sm" data-act="unblock" data-mac="'+m+'">Unblock</button>':'<button class="g sm" data-act="block" data-mac="'+m+'">Block</button>';
     t+='<tr><td class="mono">'+m+'</td><td>'+esc(d.note||'—')+'</td><td>'+esc(d.app)+'</td><td>'+plan+'</td><td>'+fmt(e)+'</td><td>'+(cl==='expired'?'—':daysLeft(e))+'</td>'+byCell+'<td>'+tag+'</td><td style="white-space:nowrap"><button class="sm" data-edit="'+m+'">Edit</button> <button class="sm" data-renew="'+m+'">Renew</button> '+actbtn+' <button class="d sm" data-act="delete" data-mac="'+m+'">Del</button></td></tr>';});
   $('devs').innerHTML=t;
 }
 function renderResellers(){
-  if(ROLE==='admin'){ $('restab').style.display='none'; $('restree').style.display=''; renderResTree(); return; }
+  if(isStaff()){ $('restab').style.display='none'; $('restree').style.display=''; renderResTree(); return; }
   $('restree').style.display='none'; $('restab').style.display='';
   var accs=S.accounts||{},ids=Object.keys(accs);
   var roots=ids.filter(function(id){var p=accs[id].parent;return !p||!accs[p];});
@@ -694,18 +800,21 @@ function acInit(nm){return String(nm||'?').split(' ').map(function(w){return w[0
 function renderResTree(){
   var accs=S.accounts||{},ids=Object.keys(accs);
   function kids(pid){return ids.filter(function(id){return (accs[id].parent||null)===pid;}).sort(function(a,b){return (accs[a].name||'').localeCompare(accs[b].name||'');});}
-  function node(id){var a=accs[id];var ck=kids(id);
-    var tier=(!a.parent)?'Master':(accs[a.parent]&&!accs[a.parent].parent?'Reseller':'Sub');
-    var tcol=tier==='Master'?'var(--violet)':tier==='Reseller'?'var(--cyd)':'#94a3b8';
+  var canAssign=(S.perms&&S.perms.assign&&S.perms.assign.length>0);
+  var isStaffType=function(t){return t==='super_admin'||t==='mini_admin';};
+  function node(id){var a=accs[id];var ck=kids(id);var typ=a.type||'reseller';
+    var isCredit=!isStaffType(typ);
+    var apiOwner=isOwner();
     var h='<li class="tnode"><div class="tbar" draggable="true" data-id="'+id+'">'+
       '<span class="tav">'+esc(acInit(a.name))+'</span>'+
-      '<span><span class="tnm">'+esc(a.name)+' <span class="tag" style="background:'+tcol+';color:#fff;font-size:9px;padding:2px 7px">'+tier+'</span></span><div class="tmeta">@'+esc(a.username)+(ck.length?(' · '+ck.length+' sub'):'')+(a.enabled?'':' · <span style="color:var(--red)">disabled</span>')+'</div></span>'+
-      '<span class="tcr">'+(a.credits||0)+' cr</span>'+
+      '<span><span class="tnm">'+esc(a.name)+' <span class="rbadge '+typ+'">'+roleLabel(typ)+'</span></span><div class="tmeta">@'+esc(a.username)+(ck.length?(' · '+ck.length+' sub'):'')+(a.enabled?'':' · <span style="color:var(--red)">disabled</span>')+'</div></span>'+
+      '<span class="tcr">'+(isCredit?((a.credits||0)+' cr'):'staff')+'</span>'+
       '<span class="tacts">'+
         '<button class="g sm" data-editacc="'+id+'">Edit</button>'+
-        '<button class="sm" data-topup="'+id+'">Credits</button>'+
+        (isCredit?'<button class="sm" data-topup="'+id+'">Credits</button>':'')+
         '<button class="g sm" data-reset="'+id+'">Pass</button>'+
-        '<button class="'+(a.api_enabled?'':'g')+' sm" style="'+(a.api_enabled?'background:var(--violet)':'')+'" data-tapi="'+id+'">API '+(a.api_enabled?'ON':'off')+'</button>'+
+        (canAssign?'<button class="g sm" data-setrole="'+id+'">Role</button>':'')+
+        (apiOwner&&isCredit?'<button class="'+(a.api_enabled?'':'g')+' sm" style="'+(a.api_enabled?'background:var(--violet)':'')+'" data-tapi="'+id+'">API '+(a.api_enabled?'ON':'off')+'</button>':'')+
         '<button class="'+(a.enabled?'g':'d')+' sm" data-tacc="'+id+'">'+(a.enabled?'On':'Off')+'</button>'+
         (a.children?'':'<button class="d sm" data-delacc="'+id+'">Del</button>')+
       '</span></div>';
@@ -774,21 +883,29 @@ document.addEventListener('click',function(e){var b=e.target.closest('button');i
   if(b.dataset.rmapp){if(confirm('Remove this app from the panel?'))api('removeApp',{id:b.dataset.rmapp}).then(load);return;}
   if(b.dataset.tapi){api('toggleApi',{id:b.dataset.tapi}).then(load);return;}
   if(b.dataset.editacc){openEditAccount(b.dataset.editacc);return;}
+  if(b.dataset.setrole){openSetRole(b.dataset.setrole);return;}
 });
+function roleOptions(sel){var opts=(S.perms&&S.perms.assign)||['reseller'];var h='';opts.forEach(function(t){h+='<option value="'+t+'"'+(t===sel?' selected':'')+'>'+roleLabel(t)+'</option>';});return h;}
+function openSetRole(id){var a=(S.accounts||{})[id]||{};modal(
+  '<h3>Assign role — '+esc(a.name||'')+'</h3><div class="sub">This sets what this account can do and which dashboard they see.</div>'+
+  '<div class="f"><label>Role</label><select id="sr_type">'+roleOptions(a.type||'reseller')+'</select></div>'+
+  '<div class="merr" id="m_err"></div><div class="foot"><button class="g" onclick="closeModal()">Cancel</button><button onclick="submitSetRole(\\''+id+'\\')">Apply</button></div>');}
+function submitSetRole(id){api('setRole',{id:id,type:$('sr_type').value}).then(function(d){if(d.ok){closeModal();load();}else $('m_err').textContent=d.error||'error';});}
 
 /* modals */
 function modal(html){$('modal').innerHTML=html;$('modalbg').classList.add('on');}
 function closeModal(){$('modalbg').classList.remove('on');}
 $('modalbg').addEventListener('click',function(e){if(e.target===$('modalbg'))closeModal();});
-function openCreate(){var isAdmin=ROLE==='admin';modal(
-  '<h3>'+(isAdmin?'Add reseller':'Add sub-reseller')+'</h3><div class="sub">They will log in with this username &amp; password.</div>'+
+function openCreate(){var staff=isStaff();var roleField=staff?('<div class="f"><label>Role</label><select id="m_type">'+roleOptions('reseller')+'</select></div>'):'';modal(
+  '<h3>'+(staff?'Add account':'Add sub-reseller')+'</h3><div class="sub">They will log in with this username &amp; password.</div>'+
   '<div class="f"><label>Display name</label><input id="m_name" placeholder="e.g. Ali Traders"></div>'+
   '<div class="f"><label>Username</label><input id="m_user" placeholder="login username" autocapitalize="none"></div>'+
   '<div class="f"><label>Password</label><input id="m_pass" placeholder="min 4 characters"></div>'+
   '<div class="f"><label>Email (optional)</label><input id="m_email" placeholder="email@example.com"></div>'+
+  roleField+
   '<div class="f"><label>Starting credits (optional)</label><input id="m_cred" type="number" placeholder="0"></div>'+
   '<div class="merr" id="m_err"></div><div class="foot"><button class="g" onclick="closeModal()">Cancel</button><button onclick="submitCreate()">Create</button></div>');}
-function submitCreate(){api('createAccount',{name:$('m_name').value,username:$('m_user').value,password:$('m_pass').value,email:$('m_email').value,credits:$('m_cred').value}).then(function(d){if(d.ok){closeModal();load();}else $('m_err').textContent=d.error||'error';});}
+function submitCreate(){var type=$('m_type')?$('m_type').value:'';api('createAccount',{name:$('m_name').value,username:$('m_user').value,password:$('m_pass').value,email:$('m_email').value,credits:$('m_cred').value,type:type}).then(function(d){if(d.ok){closeModal();load();}else $('m_err').textContent=d.error||'error';});}
 function openTopup(id){var a=S.accounts[id]||{};modal(
   '<h3>Credits — '+esc(a.name||'')+'</h3><div class="sub">Balance: <b>'+(a.credits||0)+'</b>. Enter a positive number to add, negative to take back.</div>'+
   '<div class="f"><label>Amount</label><input id="m_amt" type="number" placeholder="e.g. 10"></div>'+
@@ -838,7 +955,8 @@ function forceLatest(a){var dl=(S.config&&S.config.downloads)||{};var url=(a==='
 function previewForce(){window.open('https://zayron.tv/act/forcepreview','_blank');}
 
 function renderApi(){
-  if(ROLE==='reseller'&&S.me&&S.me.api_enabled!==true){$('apik').value='';$('apik').placeholder='API access is turned off by your administrator';$('apiExamples').innerHTML='<div class="lookup" style="margin-top:12px">Your administrator has not enabled API access for your account. Ask them to turn it on if you want to automate activations.</div>';var rg=document.querySelector('#v-api button[onclick="regenApi()"]');if(rg)rg.style.display='none';return;}
+  if(isStaff()&&!isOwner())return;   // staff (super/mini admin) don't use the automation API
+  if(!isStaff()&&S.me&&S.me.api_enabled!==true){$('apik').value='';$('apik').placeholder='API access is turned off by your administrator';$('apiExamples').innerHTML='<div class="lookup" style="margin-top:12px">Your administrator has not enabled API access for your account. Ask them to turn it on if you want to automate activations.</div>';var rg=document.querySelector('#v-api button[onclick="regenApi()"]');if(rg)rg.style.display='none';return;}
   var rg2=document.querySelector('#v-api button[onclick="regenApi()"]');if(rg2)rg2.style.display='';
   if($('apik').value)return;   // fetch the key once
   api('apiKey',{}).then(function(d){if(d.ok){$('apik').value=d.key;$('apiExamples').innerHTML=apiDocs(d.key);}else if(d.disabled){$('apik').placeholder=d.error;$('apiExamples').innerHTML='<div class="lookup" style="margin-top:12px">'+esc(d.error)+'</div>';}});}
