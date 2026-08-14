@@ -495,7 +495,29 @@ th{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.
 .modal .f{margin-bottom:11px}.modal .f label{display:block;margin-bottom:5px}.modal .f input,.modal .f select{width:100%}
 .modal .foot{display:flex;gap:10px;justify-content:flex-end;margin-top:8px}
 .merr{color:var(--red);font-size:12.5px;min-height:16px;margin-top:2px}
-@media(max-width:860px){.side{width:60px;padding:16px 6px}.side .brand .bt,.navi span,.rolechip{display:none}.navi{justify-content:center}.stats{grid-template-columns:repeat(2,1fr)}.dl{grid-template-columns:1fr}}
+.logout .lo-ic{display:none}
+@media(max-width:900px){
+  .content{padding:16px 12px}
+  .card{padding:16px 14px;overflow-x:auto}
+  .card>table,#restree>table,table{min-width:600px}
+  .stats{grid-template-columns:repeat(2,1fr)!important;gap:10px}
+  #uSummary{grid-template-columns:repeat(2,1fr)!important}
+  #modes{grid-template-columns:1fr!important}
+  .stat{padding:14px 14px}.stat .num{font-size:24px}
+  .topbar{padding:12px 14px}
+  .tbar{flex-wrap:wrap}.tbar .tcr{margin-left:auto}.tbar .tacts{width:100%;margin-top:8px;justify-content:flex-end}
+  #restree>table,.tkids{min-width:0}
+}
+@media(max-width:860px){.side{width:58px;padding:16px 6px}.side .brand .bt,.navi span,.rolechip{display:none}.navi{justify-content:center}.dl{grid-template-columns:1fr}
+  .side .foot{display:none}   /* sidebar sign-out hidden; the top-bar one takes over */
+  .logout .lo-txt{display:none}.logout .lo-ic{display:inline;font-size:17px}
+}
+@media(max-width:480px){
+  .stats{grid-template-columns:1fr!important}#uSummary{grid-template-columns:repeat(2,1fr)!important}
+  .topbar #ptitle{font-size:15px}.credits{padding:7px 10px;font-size:9.5px}.credits b{font-size:15px}
+  .filters{gap:6px}.chip{padding:6px 11px;font-size:11.5px}
+  .modal{padding:20px 16px}
+}
 </style></head><body>
 
 <div id="login" class="loginwrap"><div class="loginbox">
@@ -528,6 +550,7 @@ th{color:var(--muted);font-size:10.5px;text-transform:uppercase;letter-spacing:.
   <div class="main">
     <div class="topbar"><div id="ptitle">Dashboard</div><div class="right">
       <div class="credits">CREDITS <b id="credtot">0</b></div>
+      <button class="logout" onclick="logout()" title="Sign out"><span class="lo-txt">Sign out</span><span class="lo-ic">⎋</span></button>
     </div></div>
     <div class="content">
 
